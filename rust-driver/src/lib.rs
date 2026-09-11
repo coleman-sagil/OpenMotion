@@ -271,9 +271,10 @@ negotiated dwMaxVideoFrameSize={max_frame} dwMaxPayloadTransferSize={max_payload
     // ---- stream: frame-synced bulk read + closed-loop auto-exposure ---------
     println!("\nstreaming bulk 0x{BULK_IN_EP:02x} for {secs}s (frame-sync + auto-exposure)...");
 
-    let mut exposure_us: u32 = 400; // mid-range start
+    let mut exposure_us: u32 = 511; // leapd's own captured post-commit value (leap_init_sequence.json #369)
     let target_mean: f64 = 70.0;
     set_exposure(&handle, exposure_us);
+    set_unit5_sel4(&handle, 31); // leapd's own captured post-commit value (leap_init_sequence.json #370)
 
     let read_timeout = Duration::from_millis(500);
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -926,6 +927,32 @@ fn set_exposure<T: UsbContext>(handle: &DeviceHandle<T>, us: u32) {
         0x01,
         0x0b00,
         0x0200,
+        &data,
+        Duration::from_millis(200),
+    );
+}
+
+/// Extension Unit 5, selector 0x04 -- meaning genuinely unknown (not
+/// documented anywhere in reverse-engineering/FINDINGS.md's selector list
+/// beyond "exists"). Replicated here because leap_init_sequence.json's
+/// tail (entries 369-374, the very end of the captured init -- right where
+/// streaming should start) shows leapd writing THIS selector on unit 5,
+/// interleaved with exposure (unit 2 sel 0x0b), three times in a row,
+/// immediately after VS_COMMIT_CONTROL: (exposure=511us, this=31),
+/// (511, 31), (511, 30). Our driver's own auto-exposure loop only touches
+/// unit 2 (exposure) and only once frames are already flowing -- it never
+/// writes this selector at all. Whether it's a stream-enable trigger or
+/// just a second brightness/gain knob leapd's AE tunes alongside exposure
+/// is unconfirmed; replaying it is the cheapest way to find out empirically
+/// rather than guess from the selector number alone.
+fn set_unit5_sel4<T: UsbContext>(handle: &DeviceHandle<T>, value: u32) {
+    let data = value.to_le_bytes();
+    // wValue = selector<<8 = 0x0400 ; wIndex = (unit<<8)|interface = 0x0500
+    let _ = handle.write_control(
+        0x21,
+        0x01,
+        0x0400,
+        0x0500,
         &data,
         Duration::from_millis(200),
     );
