@@ -348,3 +348,92 @@ rather than fixed percentiles, so the demo frame isn't a dark one.
 exposure-controlled streaming over pure libusb, no leapd. Next is wrapping
 this as a `next_frame() -> (left,right)` library and pointing it at Mercury
 (Phase 2).
+
+## REGRESSION (2026-09-12): the exact 2026-06-12 driver no longer streams
+
+Returned to this after ~2 months away. `openleap bringup` now reports
+**0 reads, 0 payloads, 0 EOFs** on every attempt — the bulk endpoint never
+transmits a single byte, despite the control-transfer replay reporting
+100% success (358/358 or 357/357 depending on variant) and IR LEDs lighting.
+
+### What was tried and ruled out, with hard evidence (not guesses)
+
+1. **Two new bring-up steps added this session** (commits `9b37131`,
+   `3573e98`): a standalone `probe_and_commit_stream()` (VS_PROBE/VS_COMMIT)
+   and a replay of leapd's exact post-commit exposure/unit5-sel4 writes.
+   Premise was "standard UVC probe/commit was never captured." **This
+   premise is false** — `bringup_seq.txt`'s last 3 entries already are a
+   `SET_INTERFACE(1,0)` → `VS_PROBE_CONTROL` → `VS_COMMIT_CONTROL` sequence
+   (wValue 0x0100/0x0200, wIndex 0x0001, byte-identical format/frame
+   indices). The new functions are redundant, issuing a second probe/commit
+   after the replay's own already completed one.
+2. **Reverted to the exact original `8cce3dc` commit** (byte-identical to
+   the 2026-06-12 674-frames success) and re-ran live: **still 0 reads.**
+   This rules out the new code as the cause of the regression — the
+   already-proven-working driver, unmodified, now fails identically.
+3. **Isochronous-vs-bulk mixup**: ruled out. `lsusb -v` confirms EP 0x83 is
+   genuinely Bulk (bmAttributes=2), 512-byte packets.
+4. **Missing alt-setting switch**: ruled out. Both VC and VS interfaces have
+   exactly one alt-setting (0) per `lsusb -v` — nothing to switch to.
+5. **Proactive `clear_halt(0x83)` before the first read**: tried, succeeded
+   (no error), made no difference. The existing reactive `clear_halt` in
+   `drain_usb`'s error branch was also confirmed dead code for this failure
+   mode — every observed failure is `rusb::Error::Timeout`, which that
+   branch never reaches (it's keyed off the `Err(e)` arm, not `Timeout`).
+6. **Device stuck-firmware-state**: ruled out. Physical unplug/replug
+   (cold restart, confirmed via fresh `lsusb`/dmesg enumeration) made no
+   difference.
+7. **Physical port / power brownout**: ruled out with actual `pkexec dmesg`
+   evidence, not inference. Moved to a different physical port; the device
+   stayed electrically stable for the full 5-8s test window (single clean
+   `uvcvideo` enumeration line, zero disconnect events) while streaming
+   still produced 0 bytes. (Note: an earlier apparent "spontaneous
+   disconnect" in dmesg during this investigation turned out to be a user-
+   initiated replug, not a real brownout — corrected in-session, flagging
+   here so a future reader doesn't treat that as confirmed brownout
+   evidence.)
+8. **Raw usbmon capture of a live failing attempt**: URB submissions show
+   status -115 (EINPROGRESS, normal for an in-flight submission) and
+   completions show status -2 (ENOENT = cancelled by our own 500ms
+   read_timeout), consistently, every cycle. No STALL (-EPIPE), no other
+   device-reported error — the bus genuinely sees no response from the
+   device on EP 0x83, ever. This is a clean confirmation of "device isn't
+   sending," not a new lead.
+9. **Reviewed the 2013 OpenLeap project** (`openleap/OpenLeap` on GitHub,
+   this project's namesake) directly for comparison. Its `low-level-leap.c`
+   does no separate probe/commit call either — it's folded into one big
+   captured-and-replayed init blob, same shape as our approach. Its
+   `usb_c.lua` differs from our `usb_c_patched.lua` only in a dropped
+   `usb.endpoint_number.direction` filter clause — a Wireshark-dissector
+   compatibility fix, not a coverage gap. No new lead from this angle.
+10. **AUR `ultraleap-hand-tracking-service` (5.17.1.0) as a comparison
+    reference**: abandoned. `repo.ultraleap.com`'s CloudFront distribution
+    is dead at the TLS layer (handshake_failure immediately after
+    ClientHello, on every returned IP, while other CloudFront-hosted sites
+    work fine from this machine) — a decommissioned/restructured vendor
+    endpoint, not fixable locally, and the AUR package (2 votes, untouched
+    since mid-2024) is stale. Moreover this version line is Gemini-era,
+    built for newer hardware (Stereo IR 170 / 3Di) — it may not even
+    recognize the original Leap Motion Controller (`f182:0003`) even if
+    installed, making this comparison likely moot regardless of the CDN
+    issue. A genuinely hardware-matching comparison would need the old
+    V2/Orion-era software instead (bigger lift: period Windows/Mac
+    binaries, likely needs a VM).
+
+### The one lead not yet tested: kernel regression
+
+`libusb` has not been upgraded since before the 2026-06-12 success (no
+`libusb` entries in `pacman.log` in that window). **The kernel has**, six
+times: `linux-cachyos` 7.0.10-2 → 7.0.12-1 → 7.1.5-1 → 7.1.6-1 → 7.1.8-1 →
+7.2.0-1 → 7.2.2-1 (currently running), spanning exactly the window this
+broke. This is the last remaining untested candidate and the most plausible
+one left, given everything at the driver/protocol/power layer has been
+ruled out with direct evidence.
+
+Only one older kernel build is still cached
+(`linux-cachyos-7.1.8-1-x86_64_v3.pkg.tar.zst`, itself two releases newer
+than the working state) — not enough to bisect cleanly. The practical test
+is booting the already-installed `linux-cachyos-lts` entry (a materially
+different, more conservative branch) and re-running `openleap bringup`
+unmodified. Not done yet — requires a reboot, deferred pending the user's
+call on timing.
