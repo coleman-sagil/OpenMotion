@@ -428,6 +428,24 @@ transmits a single byte, despite the control-transfer replay reporting
     (this machine, and WhiteOut). This entry stays only to correct the
     earlier wrong inference in the historical record, not as an open
     lead.
+11. **Re-ran `openleap bringup` today (2026-09-12), fresh device, fresh
+    port**: regression reproduces identically — 357/357 control transfers
+    ok, UVC probe/commit ok, but the bulk-read loop logged `captured 0
+    frames | 0 reads, 0 payloads, 0 EOFs`. Zero reads (not zero *complete*
+    frames) means every single `read_bulk` call hit the full 500 ms
+    timeout with no bytes at all, consistent with everything captured
+    earlier. One new, so-far-unexplained side observation from this run's
+    dmesg: on the post-stream `attach_kernel_driver` cleanup (`lib.rs`,
+    the `[VC_IFACE, VS_IFACE]` reattach loop), `uvcvideo` logged `Found
+    UVC 1.00 device` immediately followed by `No streaming interface
+    found for terminal 32771` and no `/dev/videoN` was created. This may
+    just be an artifact of reattaching VC before VS (uvcvideo's terminal
+    probe running before the paired VS interface is handed back) and may
+    have nothing to do with the regression — it wasn't checked back in
+    June since the driver never relied on the kernel's own UVC binding —
+    but it blocked using V4L2/uvcvideo as an independent, libusb-free way
+    to check whether the device is actually unlocked after bring-up.
+    Flagging rather than chasing further right now.
 
 ### The one lead not yet tested: kernel regression
 
