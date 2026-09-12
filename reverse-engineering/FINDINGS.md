@@ -445,7 +445,14 @@ transmits a single byte, despite the control-transfer replay reporting
     June since the driver never relied on the kernel's own UVC binding —
     but it blocked using V4L2/uvcvideo as an independent, libusb-free way
     to check whether the device is actually unlocked after bring-up.
-    Flagging rather than chasing further right now.
+    **Update, same session:** not a real lead — closing it. The device
+    "boots inert" (per this README's own description) precisely because
+    it needs the vendor bring-up sequence before it presents a usable UVC
+    streaming pairing; `uvcvideo` failing to find a paired streaming
+    interface for the terminal is the expected shape of that, not a
+    reattach-order race. There is no libusb-free way to probe device
+    state via V4L2/uvcvideo for this device — drop this line of testing
+    for future regression work.
 
 ### The one lead not yet tested: kernel regression
 
