@@ -407,18 +407,27 @@ transmits a single byte, despite the control-transfer replay reporting
    `usb.endpoint_number.direction` filter clause — a Wireshark-dissector
    compatibility fix, not a coverage gap. No new lead from this angle.
 10. **AUR `ultraleap-hand-tracking-service` (5.17.1.0) as a comparison
-    reference**: abandoned. `repo.ultraleap.com`'s CloudFront distribution
-    is dead at the TLS layer (handshake_failure immediately after
-    ClientHello, on every returned IP, while other CloudFront-hosted sites
-    work fine from this machine) — a decommissioned/restructured vendor
-    endpoint, not fixable locally, and the AUR package (2 votes, untouched
-    since mid-2024) is stale. Moreover this version line is Gemini-era,
-    built for newer hardware (Stereo IR 170 / 3Di) — it may not even
-    recognize the original Leap Motion Controller (`f182:0003`) even if
-    installed, making this comparison likely moot regardless of the CDN
-    issue. A genuinely hardware-matching comparison would need the old
-    V2/Orion-era software instead (bigger lift: period Windows/Mac
-    binaries, likely needs a VM).
+    reference**: abandoned, and now dropped as a direction entirely.
+    `repo.ultraleap.com`'s CloudFront distribution was dead at the TLS
+    layer (handshake_failure immediately after ClientHello, on every
+    returned IP, while other CloudFront-hosted sites work fine from this
+    machine) — a decommissioned/restructured vendor endpoint, not fixable
+    locally.
+    **Correction (an earlier version of this entry was wrong):** this was
+    NOT because the Gemini-era service is the wrong hardware generation —
+    it demonstrably drives this exact device (`f182:0003`) on this exact
+    machine today (`leapd` unlocking it is how the current niri gesture
+    setup works, see the "chicken-and-egg" section above), and
+    `IntuiMotion/intuimotion/connection.py` is written against the Gemini
+    LeapC API (`leap.Listener`/`leap.Connection`), not the old V2 one. The
+    CDN being dead was the only real blocker on the comparison-capture
+    idea. That said, per direction from Matthew (2026-09-12): we are not
+    pursuing any vendor software as a dependency or reference point going
+    forward, on any platform — only our own reverse-engineered driver,
+    validated against what we've directly captured and tested ourselves
+    (this machine, and WhiteOut). This entry stays only to correct the
+    earlier wrong inference in the historical record, not as an open
+    lead.
 
 ### The one lead not yet tested: kernel regression
 
