@@ -1,7 +1,11 @@
-# OpenLeap
+# OpenMotion
 
 A fully open-source driver and hand-tracking stack for the original **Leap
 Motion Controller** — no `leapd`, no closed SDK, no dead vendor services.
+(Renamed from `OpenLeap`: the project's direction is a general open driver
+framework for multiple motion-capture/gesture-input devices, not just this
+one controller — the Leap Motion Controller is where it started and is
+still the only device implemented today.)
 
 Named in tribute to the [2013 OpenLeap initiative](https://github.com/openleap/OpenLeap),
 which set out to build an open driver for this hardware and stopped at raw
@@ -114,8 +118,8 @@ a **record** mode that saves model inputs + outputs for offline analysis.
 
 ```bash
 # deps: rust, python3, gtk4 + pygobject (system), polkit
-git clone https://github.com/julianjc84/OpenLeap.git
-cd OpenLeap
+git clone https://github.com/julianjc84/OpenMotion.git
+cd OpenMotion
 git clone https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models.git
 python -m venv --system-site-packages .venv
 .venv/bin/pip install onnxruntime opencv-python-headless numpy scipy
@@ -131,13 +135,13 @@ The closed `ultraleap-hand-tracking-service` must not hold the device;
 `run_live.sh` runs *our* Python pipeline. For the real engine — Monado's
 **Mercury** hand tracker fed by the `leap_open` driver — check out the paired
 fork **as a sibling directory** and build it; its CMake links this repo's
-`libopenleap.a` via the default `LEAP_OPEN_RUST_DIR=../OpenLeap/rust-driver`:
+`libopenleap.a` via the default `LEAP_OPEN_RUST_DIR=../OpenMotion/rust-driver`:
 
 ```bash
-# alongside OpenLeap/ (same parent dir)
+# alongside OpenMotion/ (same parent dir)
 git clone https://github.com/julianjc84/monado.git
 git -C monado switch leap_open
-# build per monado-driver/README.md, then from OpenLeap/:
+# build per monado-driver/README.md, then from OpenMotion/:
 ./run_monado.sh
 ```
 
@@ -154,7 +158,7 @@ now the reference/validation oracle.
 - No Ultraleap code, blobs, or SDK output is included or required. The
   protocol knowledge was obtained by observing the device's own USB traffic.
 
-See **`LICENSING.md`** for the full posture: why OpenLeap doesn't breach the
+See **`LICENSING.md`** for the full posture: why OpenMotion doesn't breach the
 Ultraleap EULA (clean-room USB reverse engineering under interoperability
 exceptions; no SDK/Image API used as the frame source), and the lines it must
 not cross (never bundle their closed materials; keep GPL linking off-by-

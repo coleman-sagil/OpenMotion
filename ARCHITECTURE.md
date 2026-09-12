@@ -1,6 +1,6 @@
-# OpenLeap — Stack Decision: which hand-tracking engine, and why
+# OpenMotion — Stack Decision: which hand-tracking engine, and why
 
-This records *why* OpenLeap tracks hands with Monado's **Mercury** engine
+This records *why* OpenMotion tracks hands with Monado's **Mercury** engine
 rather than maturing our own pipeline or staying on Ultraleap's closed stack —
 and what that means for the niri integration (which API niri consumes).
 

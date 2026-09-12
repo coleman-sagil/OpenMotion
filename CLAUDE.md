@@ -1,4 +1,6 @@
-# OpenLeap
+# OpenMotion
+
+(Renamed from `OpenLeap` — see README.md for why.)
 
 Open driver + hand tracking for the original Leap Motion Controller. Read
 `README.md` first — it documents the device protocol and the pipeline stages.
