@@ -471,3 +471,108 @@ is booting the already-installed `linux-cachyos-lts` entry (a materially
 different, more conservative branch) and re-running `openleap bringup`
 unmodified. Not done yet — requires a reboot, deferred pending the user's
 call on timing.
+
+## 2026-09-12 (later): kernel test skipped; control plane proven byte-identical
+
+Matthew opted not to reboot — `uname -r` confirmed still `7.2.2-1-cachyos`,
+so the LTS A/B was **not** run. Direction was instead "make it work on the
+current kernel." What follows is all on `7.2.2-1-cachyos`.
+
+### The replay was open-loop; it no longer is
+
+Every prior "357/357 ok" line reported **transport-level** success only —
+the device ACK'd each SET_CUR. Nothing had ever read device state back. Added
+`GET_CUR` instrumentation and ran live:
+
+- **Exposure register round-trips.** Wrote 511 µs to extension unit 2
+  selector 0x0b, read back `511`. The vendor extension-unit config
+  demonstrably *sticks on-device*, it isn't merely ACK'd and dropped.
+- **UVC negotiation is byte-identical to the known-working June state.**
+  Post-COMMIT `GET_CUR` on the VideoStreaming interface returns
+  `00000102ac5301000000000000000000000000040b0000400000` (bmHint=0,
+  bFormatIndex=1, bFrameIndex=2, dwFrameInterval=86956,
+  dwMaxVideoFrameSize=721920, dwMaxPayloadTransferSize=16384). That is the
+  **same 26 bytes leapd itself committed** — they are preserved verbatim as
+  the second-to-last entry of `bringup_seq.txt`, captured during the June run
+  that produced 674 frames.
+- Therefore `dwMaxVideoFrameSize=721920` (frame index 4's size, reported while
+  frame index 2 is selected) is **not an anomaly and not our bug** — it is
+  exactly what the vendor daemon committed when streaming worked. **This
+  retires the stale code comment** in `probe_and_commit_stream` claiming the
+  device ignores the requested frame index; that comment was written from
+  incomplete data and should not be treated as a finding.
+
+**Consequence: the entire UVC probe/commit layer is ruled out.** The device's
+streaming negotiation state today is bit-identical to its streaming
+negotiation state when it worked.
+
+### Fixed: SET_CONFIGURATION issued while holding a usbfs claim
+
+`bring_up_with_reset()` called `set_active_configuration(1)` *after*
+re-claiming both interfaces — backwards (configure, then claim). Live dmesg
+confirmed the kernel objecting:
+
+```
+usb 3-1: usbfs: interface 0 claimed by usbfs while 'openleap' sets config #1
+```
+
+Fixed by releasing both claims, setting configuration, then re-claiming and
+re-selecting alt 0. Verified via dmesg that the warning is **gone**; replay
+count unchanged at 357/357. **Not the root cause — bulk endpoint still
+silent — but a real spec-correctness fix, kept.**
+
+### Also ruled out this session
+
+- **Slow-start / timeout too short.** Raised the per-read bulk timeout
+  500 ms → 5000 ms over a 12 s window: still `0 reads, 0 payloads, 0 EOFs`.
+  Reverted to 500 ms afterwards (a 5 s timeout only makes each silent read
+  cost 10× more).
+- **Runtime PM / USB2 LPM.** `power/control=auto`, `autosuspend=2` s,
+  `usb2_hardware_lpm` empty (never negotiated — a 2013 device with no LPM BOS
+  descriptor). Weak on its own evidence: device suspend would gate EP0 too,
+  and 357 back-to-back control transfers leave no 2-second idle window for the
+  timer to fire. Not pursued further.
+- **The closed vendor service interfering.** `systemctl is-active
+  ultraleap-hand-tracking-service` → `inactive` for every run above.
+
+### IR LEDs confirmed lit during a failing run
+
+`bringup` never set the LED mask (only `stream` did), which made "are the LEDs
+on" ambiguous between "pipeline dead" and "mask never set." Added an explicit
+`set_leds(0b111)` before the read loop; Matthew confirmed via phone camera
+(850 nm is invisible to the eye) that **the IR LEDs are on** while the driver
+reads 0 bytes. This corroborates the existing note at the top of the
+regression section rather than breaking new ground, but it is now an
+*unconfounded* observation.
+
+Caveat worth keeping: LED-on proves power, control-path delivery, and physical
+actuation. It does **not** prove the sensor readout pipeline is armed — LED
+control is a separate register poke (unit 5 sel 0x03), independent of whether
+the imager is streaming.
+
+### Where this leaves the diagnosis
+
+Every host-observable signal — control-transfer success, vendor register
+read-back fidelity, the full 26-byte UVC negotiation struct, and physical LED
+behavior — is now **identical to the known-working state**, and the bulk IN
+endpoint still NAKs indefinitely.
+
+Re-reading the usbmon evidence (entry 8 above) with that in hand: submissions
+show -115 (in flight), completions show -2 (our own cancellation), and NAKs
+never appear in usbmon at all. That is not "the host failed to submit" — it is
+**the device NAKing every IN token**, i.e. *the device has no data to give*.
+This is a "stream never starts" problem, not a "bulk read plumbing" problem,
+and it points device-side rather than at the kernel.
+
+The host-side software space is now genuinely exhausted; further driver-side
+experiments are not the efficient next move. The two discriminating tests
+left, both requiring a human:
+
+1. **Run the same driver against the same device on WhiteOut.** Cleanest
+   split between "this host changed" and "this device/interaction changed."
+   Streams there → this machine. Silent there → the kernel was never the story.
+2. **(Requires a directive exception.)** Check whether the vendor daemon can
+   still stream this device on this kernel *at all*. It is still installed.
+   This is purely diagnostic, not a dependency, but it conflicts with the
+   standing "no vendor software as a reference point" directive, so it is
+   Matthew's call and was not done unilaterally.

@@ -275,6 +275,25 @@ negotiated dwMaxVideoFrameSize={max_frame} dwMaxPayloadTransferSize={max_payload
     let target_mean: f64 = 70.0;
     set_exposure(&handle, exposure_us);
     set_unit5_sel4(&handle, 31); // leapd's own captured post-commit value (leap_init_sequence.json #370)
+    // `bringup` never used to set the LED mask -- only `stream` did -- which made
+    // "are the IR LEDs actually on" ambiguous between "pipeline dead" and "replay
+    // left the mask off". Force all three on so a physical camera check here is
+    // unconfounded: LEDs on but 0 bytes = host/transport; LEDs off = device never
+    // reached streaming state internally, independent of the kernel.
+    set_leds(&handle, 0b111);
+    println!("  [diag] all 3 IR LEDs commanded on (850nm, invisible to the eye -- check via phone camera)");
+
+    // [diag] confirm the vendor config actually stuck on-device, not just ACK'd.
+    {
+        let mut buf = [0u8; 4];
+        match handle.read_control(0xa1, 0x81, 0x0b00, 0x0200, &mut buf, Duration::from_millis(500)) {
+            Ok(n) => println!(
+                "  [diag] exposure readback (unit2 sel0x0b): wrote {exposure_us}us, device reports {}us ({n} bytes)",
+                u32::from_le_bytes(buf)
+            ),
+            Err(e) => println!("  [diag] exposure readback FAILED: {e}"),
+        }
+    }
 
     let read_timeout = Duration::from_millis(500);
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -1092,6 +1111,12 @@ fn probe_and_commit_stream<T: UsbContext>(handle: &DeviceHandle<T>) -> rusb::Res
     // top of, rather than fabricating one from scratch.
     let mut probe = [0u8; UVC_STREAMING_CONTROL_LEN];
     handle.read_control(DEV_TO_HOST_CLASS_IFACE, GET_CUR, w_value_probe, w_index, &mut probe, timeout)?;
+    eprintln!(
+        "  [diag] probe baseline: fmt={} frame={} bytes={}",
+        probe[2],
+        probe[3],
+        hex_bytes(&probe)
+    );
     probe[2] = LEAP_FORMAT_INDEX;
     probe[3] = LEAP_FRAME_INDEX;
     handle.write_control(HOST_TO_DEV_CLASS_IFACE, SET_CUR, w_value_probe, w_index, &probe, timeout)?;
@@ -1102,6 +1127,13 @@ fn probe_and_commit_stream<T: UsbContext>(handle: &DeviceHandle<T>) -> rusb::Res
     // back, not our original (possibly out-of-range) proposal.
     let mut negotiated = [0u8; UVC_STREAMING_CONTROL_LEN];
     handle.read_control(DEV_TO_HOST_CLASS_IFACE, GET_CUR, w_value_probe, w_index, &mut negotiated, timeout)?;
+    eprintln!(
+        "  [diag] probe after our SET_CUR(fmt={LEAP_FORMAT_INDEX},frame={LEAP_FRAME_INDEX}): \
+got back fmt={} frame={} bytes={}",
+        negotiated[2],
+        negotiated[3],
+        hex_bytes(&negotiated)
+    );
     handle.write_control(
         HOST_TO_DEV_CLASS_IFACE,
         SET_CUR,
@@ -1111,9 +1143,35 @@ fn probe_and_commit_stream<T: UsbContext>(handle: &DeviceHandle<T>) -> rusb::Res
         timeout,
     )?;
 
+    // Read back what actually got committed (device's post-COMMIT CUR state)
+    // -- confirms whether COMMIT stuck, independent of what PROBE echoed.
+    let mut committed = [0u8; UVC_STREAMING_CONTROL_LEN];
+    if handle
+        .read_control(
+            DEV_TO_HOST_CLASS_IFACE,
+            GET_CUR,
+            VS_COMMIT_CONTROL << 8,
+            w_index,
+            &mut committed,
+            timeout,
+        )
+        .is_ok()
+    {
+        eprintln!(
+            "  [diag] post-COMMIT GET_CUR: fmt={} frame={} bytes={}",
+            committed[2],
+            committed[3],
+            hex_bytes(&committed)
+        );
+    }
+
     let max_frame_size = u32::from_le_bytes(negotiated[18..22].try_into().unwrap());
     let max_payload = u32::from_le_bytes(negotiated[22..26].try_into().unwrap());
     Ok((max_frame_size, max_payload))
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
 }
 
 fn detach_and_claim<T: UsbContext>(handle: &mut DeviceHandle<T>, iface: u8) -> rusb::Result<bool> {
@@ -1205,8 +1263,26 @@ fn bring_up_with_reset(seq: &[Transfer]) -> rusb::Result<(DeviceHandle<Context>,
             break;
         }
     }
-    let handle = new_handle.ok_or(rusb::Error::NoDevice)?;
+    let mut handle = new_handle.ok_or(rusb::Error::NoDevice)?;
+
+    // Re-selecting the same configuration value is a legitimate, spec-defined
+    // way to force every interface's alt-setting and endpoint halt state back
+    // to default (USB 2.0 spec 9.4.7) -- almost certainly why leapd's capture
+    // does it here, right after the port reset. But issuing SET_CONFIGURATION
+    // while we ourselves hold a usbfs claim on interface 0 (from the
+    // `open_claimed()` call just above) logs a kernel warning
+    // ("usbfs: interface 0 claimed by usbfs while 'openleap' sets config #1")
+    // -- confirmed live on 7.2.2-1-cachyos, 2026-09-12, not present in any
+    // prior investigation note. Release our claims first so the
+    // reconfiguration actually lands cleanly, then re-claim to keep replaying.
+    for iface in [VC_IFACE, VS_IFACE] {
+        let _ = handle.release_interface(iface);
+    }
     let _ = handle.set_active_configuration(1); // mirrors the captured SET_CONFIGURATION(1)
+    for iface in [VC_IFACE, VS_IFACE] {
+        detach_and_claim(&mut handle, iface)?;
+    }
+    let _ = handle.set_alternate_setting(VS_IFACE, 0);
 
     replayed += replay_seq(&handle, post);
     Ok((handle, replayed))
