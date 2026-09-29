@@ -260,6 +260,10 @@ fn run_bringup() -> rusb::Result<()> {
     );
     println!("(IR LEDs should be on now if bring-up worked)");
 
+    // leapd's captured init does SET_INTERFACE(1,0) BEFORE probe/commit, not
+    // after. Doing it after VS_COMMIT may reset the committed stream state.
+    arm_streaming_endpoint(&handle);
+
     match probe_and_commit_stream(&handle) {
         Ok((max_frame, max_payload)) => println!(
             "UVC probe/commit ok: format={LEAP_FORMAT_INDEX} frame={LEAP_FRAME_INDEX} \
@@ -267,6 +271,9 @@ negotiated dwMaxVideoFrameSize={max_frame} dwMaxPayloadTransferSize={max_payload
         ),
         Err(e) => println!("UVC probe/commit FAILED: {e} -- endpoint will likely stay silent"),
     }
+
+    // clear any stale halt condition on the bulk endpoint before reading
+    let _ = handle.clear_halt(BULK_IN_EP);
 
     // ---- stream: frame-synced bulk read + closed-loop auto-exposure ---------
     println!("\nstreaming bulk 0x{BULK_IN_EP:02x} for {secs}s (frame-sync + auto-exposure)...");
@@ -563,6 +570,8 @@ fn run_stream() -> rusb::Result<()> {
         });
     }
 
+    arm_streaming_endpoint(&handle);
+
     match probe_and_commit_stream(&handle) {
         Ok((max_frame, max_payload)) => eprintln!(
             "stream: UVC probe/commit ok (format={LEAP_FORMAT_INDEX} frame={LEAP_FRAME_INDEX}, \
@@ -571,6 +580,7 @@ negotiated frame size {max_frame}B, payload size {max_payload}B)"
         Err(e) => eprintln!("stream: UVC probe/commit FAILED: {e} -- endpoint will likely stay silent"),
     }
 
+    let _ = handle.clear_halt(BULK_IN_EP);
     let applied_leds = led_mask.load(Ordering::Relaxed) as u8;
     set_leds(&handle, applied_leds);
     set_exposure(&handle, exposure.load(Ordering::Relaxed));
@@ -1097,81 +1107,122 @@ const LEAP_FRAME_INDEX: u8 = 2;
 /// number, wrong claim, or the device doesn't answer standard UVC
 /// requests at all) rather than a sensor/vendor-protocol issue.
 fn probe_and_commit_stream<T: UsbContext>(handle: &DeviceHandle<T>) -> rusb::Result<(u32, u32)> {
-    const GET_CUR: u8 = 0x81;
     const SET_CUR: u8 = 0x01;
-    const DEV_TO_HOST_CLASS_IFACE: u8 = 0xa1;
     const HOST_TO_DEV_CLASS_IFACE: u8 = 0x21;
 
     let timeout = Duration::from_millis(500);
-    let w_value_probe = VS_PROBE_CONTROL << 8;
     let w_index = u16::from(VS_IFACE);
 
-    // GET_CUR VS_PROBE_CONTROL: a valid baseline struct straight from the
-    // device (current/default negotiation state) to build our request on
-    // top of, rather than fabricating one from scratch.
-    let mut probe = [0u8; UVC_STREAMING_CONTROL_LEN];
-    handle.read_control(DEV_TO_HOST_CLASS_IFACE, GET_CUR, w_value_probe, w_index, &mut probe, timeout)?;
-    eprintln!(
-        "  [diag] probe baseline: fmt={} frame={} bytes={}",
-        probe[2],
-        probe[3],
-        hex_bytes(&probe)
-    );
-    probe[2] = LEAP_FORMAT_INDEX;
-    probe[3] = LEAP_FRAME_INDEX;
-    handle.write_control(HOST_TO_DEV_CLASS_IFACE, SET_CUR, w_value_probe, w_index, &probe, timeout)?;
+    // Use leapd's exact probe/commit payloads from the captured init sequence
+    // (entries 366-367 of leap_init_sequence.json). Previous code did
+    // GET_CUR → SET_CUR → GET_CUR → COMMIT; leapd sends the probe directly
+    // without any preceding GET_CUR. The extra GET_CURs may have caused
+    // the device to enter a different internal state path.
+    let probe: [u8; UVC_STREAMING_CONTROL_LEN] = [
+        0x01, 0x00, // bmHint: dwFrameInterval
+        0x01,       // bFormatIndex
+        0x02,       // bFrameIndex
+        0xac, 0x53, 0x01, 0x00, // dwFrameInterval: 86956 (100ns) ≈ 115 fps
+        0x00, 0x00, // wKeyFrameRate
+        0x00, 0x00, // wPFrameRate
+        0x00, 0x00, // wCompQuality
+        0x00, 0x00, // wCompWindowSize
+        0x00, 0x00, // wDelay
+        0x00, 0x04, 0x0b, 0x00, // dwMaxVideoFrameSize: 721920
+        0x00, 0x40, 0x00, 0x00, // dwMaxPayloadTransferSize: 16384
+    ];
+    let commit: [u8; UVC_STREAMING_CONTROL_LEN] = [
+        0x00, 0x00, // bmHint: none (post-negotiation)
+        0x01, 0x02,
+        0xac, 0x53, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x04, 0x0b, 0x00,
+        0x00, 0x40, 0x00, 0x00,
+    ];
 
-    // Re-read: the device clamps dwFrameInterval/dwMaxVideoFrameSize/
-    // dwMaxPayloadTransferSize to what it can actually deliver for the
-    // requested format/frame -- commit must carry those negotiated values
-    // back, not our original (possibly out-of-range) proposal.
-    let mut negotiated = [0u8; UVC_STREAMING_CONTROL_LEN];
-    handle.read_control(DEV_TO_HOST_CLASS_IFACE, GET_CUR, w_value_probe, w_index, &mut negotiated, timeout)?;
-    eprintln!(
-        "  [diag] probe after our SET_CUR(fmt={LEAP_FORMAT_INDEX},frame={LEAP_FRAME_INDEX}): \
-got back fmt={} frame={} bytes={}",
-        negotiated[2],
-        negotiated[3],
-        hex_bytes(&negotiated)
-    );
+    eprintln!("  [diag] probe SET_CUR (leapd-exact): {}", hex_bytes(&probe));
+    handle.write_control(
+        HOST_TO_DEV_CLASS_IFACE,
+        SET_CUR,
+        VS_PROBE_CONTROL << 8,
+        w_index,
+        &probe,
+        timeout,
+    )?;
+    eprintln!("  [diag] commit SET_CUR (leapd-exact): {}", hex_bytes(&commit));
     handle.write_control(
         HOST_TO_DEV_CLASS_IFACE,
         SET_CUR,
         VS_COMMIT_CONTROL << 8,
         w_index,
-        &negotiated,
+        &commit,
         timeout,
     )?;
 
-    // Read back what actually got committed (device's post-COMMIT CUR state)
-    // -- confirms whether COMMIT stuck, independent of what PROBE echoed.
-    let mut committed = [0u8; UVC_STREAMING_CONTROL_LEN];
-    if handle
-        .read_control(
-            DEV_TO_HOST_CLASS_IFACE,
-            GET_CUR,
-            VS_COMMIT_CONTROL << 8,
-            w_index,
-            &mut committed,
-            timeout,
-        )
-        .is_ok()
-    {
-        eprintln!(
-            "  [diag] post-COMMIT GET_CUR: fmt={} frame={} bytes={}",
-            committed[2],
-            committed[3],
-            hex_bytes(&committed)
-        );
-    }
-
-    let max_frame_size = u32::from_le_bytes(negotiated[18..22].try_into().unwrap());
-    let max_payload = u32::from_le_bytes(negotiated[22..26].try_into().unwrap());
+    let max_frame_size = u32::from_le_bytes(probe[18..22].try_into().unwrap());
+    let max_payload = u32::from_le_bytes(probe[22..26].try_into().unwrap());
     Ok((max_frame_size, max_payload))
 }
 
 fn hex_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
+}
+
+/// Re-select VideoStreaming alt setting 0 *after* VS_COMMIT and immediately
+/// before the first bulk read.
+///
+/// This looks like a no-op and was previously dismissed as one ("both
+/// interfaces have exactly one alt setting, so there's nothing to switch to"
+/// -- see the ruled-out list in reverse-engineering/FINDINGS.md). That
+/// reasoning is wrong, and the distinction matters:
+///
+/// `usb_set_interface()` does far more than pick an alt setting. It runs
+/// `usb_disable_interface()` + `usb_enable_interface(reset_eps=true)` and
+/// drives a full xHCI Configure Endpoint drop+add through
+/// `usb_hcd_alloc_bandwidth()` -- i.e. the host tears down and rebuilds the
+/// endpoint context and its transfer ring, resetting sequence/data-toggle
+/// state. `usb_clear_halt()` (already tried, no effect) only reaches
+/// `usb_reset_endpoint()`/`xhci_endpoint_reset()`, which is strictly less.
+///
+/// A May-2026 linux-media RFC ("media: uvcvideo: reset alt setting before
+/// clearing halt") describes exactly this failure mode on **bulk-transport
+/// UVC devices**: the host carries the previous stream's sequence state into
+/// the next stream while the device expects initial state, and only
+/// `usb_set_interface(intf, 0)` -- not `clear_halt` -- recovers it. This
+/// device is bulk-transport UVC, and it is re-streamed after a port reset
+/// plus a prior uvcvideo binding, so it is squarely in that shape.
+///
+/// Position matters: `open_claimed()` already calls this, but that happens
+/// *before* the bring-up replay and before probe/commit. The ring state that
+/// needs clearing is the state left behind by everything that came after.
+fn arm_streaming_endpoint<T: UsbContext>(handle: &DeviceHandle<T>) {
+    match handle.set_alternate_setting(VS_IFACE, 0) {
+        Ok(()) => println!("  [diag] re-armed VS endpoint: SET_INTERFACE({VS_IFACE}, 0) ok"),
+        Err(e) => println!("  [diag] SET_INTERFACE({VS_IFACE}, 0) failed: {e}"),
+    }
+}
+
+/// Unbind uvcvideo from the Leap's interfaces via sysfs, so the kernel driver
+/// doesn't leave stale endpoint state that interferes with our libusb bulk reads.
+/// Runs silently if the driver isn't bound or the sysfs write fails (we'll try
+/// `detach_kernel_driver` later as a fallback).
+fn unbind_uvcvideo() {
+    let unbind_path = "/sys/bus/usb/drivers/uvcvideo/unbind";
+    for entry in std::fs::read_dir("/sys/bus/usb/devices").into_iter().flatten().flatten() {
+        let path = entry.path();
+        let vid_path = path.join("idVendor");
+        if let Ok(vid) = std::fs::read_to_string(&vid_path) {
+            if vid.trim() == "f182" {
+                let dev_name = path.file_name().unwrap().to_string_lossy().to_string();
+                for iface in 0..=1 {
+                    let iface_name = format!("{dev_name}:1.{iface}");
+                    let _ = std::fs::write(unbind_path, &iface_name);
+                }
+                eprintln!("  [diag] unbind uvcvideo from {dev_name}");
+                return;
+            }
+        }
+    }
 }
 
 fn detach_and_claim<T: UsbContext>(handle: &mut DeviceHandle<T>, iface: u8) -> rusb::Result<bool> {
@@ -1241,6 +1292,8 @@ const RESET_SPLIT: usize = 52;
 /// Returns the fresh handle (the pre-reset one is unusable after this) and
 /// how many of the 358 total transfers the device accepted.
 fn bring_up_with_reset(seq: &[Transfer]) -> rusb::Result<(DeviceHandle<Context>, usize)> {
+    unbind_uvcvideo();
+
     let pre = &seq[..RESET_SPLIT.min(seq.len())];
     let post = &seq[(RESET_SPLIT + 1).min(seq.len())..]; // skip the stray SET_INTERFACE marker at RESET_SPLIT
 
@@ -1275,14 +1328,26 @@ fn bring_up_with_reset(seq: &[Transfer]) -> rusb::Result<(DeviceHandle<Context>,
     // -- confirmed live on 7.2.2-1-cachyos, 2026-09-12, not present in any
     // prior investigation note. Release our claims first so the
     // reconfiguration actually lands cleanly, then re-claim to keep replaying.
+    // Unbind uvcvideo again — it re-binds after the USB reset above.
+    unbind_uvcvideo();
+
     for iface in [VC_IFACE, VS_IFACE] {
         let _ = handle.release_interface(iface);
     }
-    let _ = handle.set_active_configuration(1); // mirrors the captured SET_CONFIGURATION(1)
+    let _ = handle.set_active_configuration(1); // first SET_CONFIGURATION(1) -- mirrors leapd entry 62
     for iface in [VC_IFACE, VS_IFACE] {
         detach_and_claim(&mut handle, iface)?;
     }
     let _ = handle.set_alternate_setting(VS_IFACE, 0);
+    // leapd's capture shows a second SET_CONFIGURATION(1) (entry 68) after
+    // SET_INTERFACE and some hub operations. Release/reclaim to do it cleanly.
+    for iface in [VC_IFACE, VS_IFACE] {
+        let _ = handle.release_interface(iface);
+    }
+    let _ = handle.set_active_configuration(1); // second SET_CONFIGURATION(1) -- mirrors leapd entry 68
+    for iface in [VC_IFACE, VS_IFACE] {
+        detach_and_claim(&mut handle, iface)?;
+    }
 
     replayed += replay_seq(&handle, post);
     Ok((handle, replayed))
