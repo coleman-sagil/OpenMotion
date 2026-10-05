@@ -140,12 +140,179 @@ Leap USB frames  ──►  leap_open Monado driver  ──►  Mercury (ht)  �
                                                                     niri branch A1 gestures
 ```
 
-## Status
+## Status (as of initial Mercury integration)
 
 - Driver + Monado `leap_open` integration: **built, links, runs end-to-end**;
   Mercury tracks correctly after the column-deinterleave fix.
 - Both Mercury and the Ultraleap stack run well on the dev machine — Mercury is
   the chosen engine; Ultraleap is retained only as a comparison baseline.
-- **Open / next:** decide the LeapC fork (shim vs. native), tune Mercury jitter
-  (smoothing / prediction), then gesture extraction (pinch/grab/swipe with
-  hysteresis) into niri, then upstream the `leap_open` driver to Monado.
+
+---
+
+# OpenMotion SDK Architecture — Multi-Sensor Abstraction (Oct 2026)
+
+OpenMotion has evolved from a single-device Leap driver into a **universal
+sensor driver and detector platform**. It is the public SDK that handles
+device init, frame capture, hand detection, and multi-sensor fusion.
+IntuiMotion (private) consumes its output for gesture recognition, action
+dispatch, and UI.
+
+## The Four Layers
+
+```
+L0  Raw sensor bytes     (device-private — never crosses SDK boundary)
+     │
+     ▼
+L1  Geometry: PoseFrame  ← THE SDK PUBLIC API BOUNDARY
+     │
+     ▼
+L2  Derived semantics    (pinch/grab/extended — shared code, never per-driver)
+     │
+     ▼
+L3  Gesture events       (IntuiMotion private — engage, swipe, pinch-click)
+```
+
+### L0 — Raw Transport (per-driver, private)
+
+Each sensor type owns its own raw transport. This layer never leaks into
+the SDK contract — it's the driver's problem.
+
+| Sensor | L0 output | Protocol |
+|--------|-----------|----------|
+| Leap Motion (IR stereo) | 1280×240 8-bit gray, column-interleaved left/right | LFRM binary (our own libusb driver) |
+| USB webcam (RGB mono) | 640×480 YUYV frames | V4L2 (Linux), DirectShow (Windows), AVFoundation (macOS) |
+| Depth camera (future) | depth map + RGB | libfreenect2 / librealsense |
+| Radar (future) | range-Doppler returns | device-specific |
+
+### L1 — Geometry: PoseFrame (the SDK boundary)
+
+One neutral type crosses the public boundary. Every driver emits this or
+something that can be trivially converted into it.
+
+```
+PoseFrame
+├─ seq: u64              monotonic frame counter
+├─ t_capture_ns: u64     monotonic timestamp (nanoseconds)
+├─ source_id: str        which sensor produced this
+├─ caps: CapsBitmask     what this source can produce
+└─ poses: [Pose]         one per tracked hand
+    ├─ track_id: u32     stable across frames (NOT handedness-keyed)
+    ├─ palm: Affine3     position + optional orientation
+    ├─ velocity: Vec3    palm velocity (m/s)
+    ├─ joints: [Joint; 26] | None
+    │   └─ Joint { position: Vec3, orientation: Quat, valid: bool }
+    └─ confidence: f32   0.0–1.0, source-provided
+```
+
+**Coordinate system:** right-handed, SI meters, +X right, +Y up, −Z away
+from user. Matches OpenXR and ROS REP-103. Each adapter converts into
+this exactly once.
+
+**Joint ordering:** 26 entries in **OpenXR `XrHandJointEXT` order** (palm,
+wrist, thumb metacarpal through tip, index through pinky). Absent joints
+are `valid=false` — never interpolated, never fabricated.
+
+**Capability flags:**
+```
+PALM_POSE       0x01   palm position available
+PALM_ORIENT     0x02   palm orientation (not just position)
+VELOCITY        0x04   velocity vector
+JOINTS_FULL     0x08   all 26 joints
+JOINTS_PARTIAL  0x10   some joints (e.g. 21-landmark webcam)
+CHIRALITY       0x20   left/right classification
+DISCRETE_EVENT  0x40   gesture-level events (e.g. radar tap)
+```
+
+### L2 — Derived Semantics (shared, never per-driver)
+
+Computed identically for ALL sensor types in shared code. This is
+essential: if each driver computed its own `pinch_strength`,
+`pinch_threshold=0.85` in IntuiMotion's gesture config would silently
+mean a physically different gesture on each device.
+
+```
+DerivedPose
+├─ pinch_strength: f32      index-thumb distance → 0.0–1.0
+├─ grab_strength: f32       finger curl aggregate → 0.0–1.0
+├─ extended: [bool; 5]      per-finger extension state
+├─ chirality: Left | Right
+├─ chirality_confidence: f32
+```
+
+Gesture rules in IntuiMotion's YAML config gain a `requires:` key:
+```yaml
+pinch_click:
+  requires: [JOINTS_FULL]   # ineligible on palm-only sensors
+  threshold: 0.85
+
+wave_dismiss:
+  requires: [PALM_POSE, VELOCITY]  # works even on radar
+  speed_min: 0.8
+```
+
+### L3 — Gesture Events (IntuiMotion private)
+
+Engage, disengage, pinch-click, grab-fist, swipe, two-hand gestures.
+This is product differentiation — stays in IntuiMotion, never in the
+SDK.
+
+## Multi-Sensor Fusion
+
+When multiple sensors run simultaneously, fusion happens at L1 — it
+merges PoseFrames from different sources into a single, higher-confidence
+PoseFrame.
+
+```
+IR stereo (looking UP)     ──►  PoseFrame (source=leap)   ──┐
+                                                             ├──► FusionEngine ──► merged PoseFrame
+RGB webcam (looking FORWARD) ──► PoseFrame (source=cam)   ──┘
+```
+
+**Why orthogonal angles help:** the Leap sees fingers well from below
+(palm-up view) but loses them when the hand rotates edge-on. The webcam
+sees the hand's profile well from the front but can't resolve depth. Each
+sensor's blind spot is the other's strength.
+
+Fusion algorithm:
+1. **Temporal alignment:** match frames within a configurable window
+   (default 50ms) using `t_capture_ns`
+2. **Hand matching:** pair hands across sources by `chirality` + spatial
+   proximity of palm position
+3. **Joint merge:** weighted average by source confidence × source weight;
+   if only one source provides a joint, pass through with reduced
+   confidence
+4. **Extrinsic calibration:** a 4×4 rigid-body transform between sensor
+   coordinate systems, determined once at setup time
+
+## Source + Engine Plugin Model
+
+A driver has two roles that can be separate:
+- **Source**: produces L0 raw data (the Rust USB driver, a V4L2 capture)
+- **Engine**: turns L0 into L1 joints (Mercury, MediaPipe, a custom ONNX
+  model)
+
+A sensor can register as Source-only (dumb capture, needs an external
+engine), Engine-only (e.g. Mercury consuming frames from any source), or
+Source+Engine (self-contained, like a webcam running its own MediaPipe
+landmark detector). Each new adapter is ~80 lines of coordinate
+conversion, not a re-implementation of gesture semantics.
+
+## Cross-Platform Strategy
+
+| Platform | USB driver | Webcam | Engine |
+|----------|-----------|--------|--------|
+| Linux (CachyOS/Arch) | libusb (working) | V4L2 ctypes | Mercury (ONNX) |
+| Linux (Ubuntu/Pop) | libusb | V4L2 ctypes | Mercury (ONNX) |
+| Windows | libusb (WinUSB) | DirectShow | Mercury (ONNX) |
+| macOS | libusb (homebrew) | AVFoundation | Mercury (ONNX) |
+
+The Rust driver cross-compiles via `rusb` (wraps libusb). The webcam
+capture layer is platform-specific behind a common trait. The engine
+(Mercury/MediaPipe) uses ONNX, which is inherently cross-platform.
+
+## Licensing
+
+OpenMotion is BSL-1.0. This is essential: IntuiMotion (private) depends
+on OpenMotion, so OpenMotion's license must never force IntuiMotion open
+(ruling out GPL/AGPL). BSL-1.0 is permissive enough for downstream
+consumers to build proprietary products on top of the SDK.

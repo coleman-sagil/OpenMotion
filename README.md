@@ -27,10 +27,10 @@ grew out of).
 | `tracking/` | Python hand-tracking pipeline (Mercury ONNX inference, live GTK4 viewer, stereo calibration/triangulation) — now the reference/validation oracle, not the product (see `ARCHITECTURE.md`) |
 | `monado-driver/` | design/reference docs for the Monado `leap_open` driver — the engine path Leap → Mercury (the built C driver lives in the monado fork) |
 | `reverse-engineering/` | the protocol recon that made the driver possible (usbmon capture analysis, decoded init sequence) — historical record, nothing runs from here |
-| `hand-tracking-models/` | Monado's openly-licensed (CC-BY-SA 4.0) Mercury ONNX models — separate git clone, see Setup |
+| `hand-tracking-models/` | Monado's openly-licensed (CC-BY-SA 4.0) Mercury ONNX models + MediaPipe palm/landmark models — separate git clone, see Setup |
 | `run_live.sh` | one-command live viewer (our Python pipeline) |
 | `run_monado.sh` | one-command Leap → Mercury (Monado) harness launcher |
-| `ARCHITECTURE.md` / `LICENSING.md` | stack decision (why Mercury) and the Ultraleap-EULA posture |
+| `ARCHITECTURE.md` / `LICENSING.md` | stack decision (why Mercury → multi-sensor) and the Ultraleap-EULA posture |
 
 ## How the driver works (`rust-driver/`)
 
@@ -166,13 +166,25 @@ default downstream).
 
 ## Status / roadmap
 
-Our own 2D + 3D Python pipeline works and is validated (depth matches ruler;
-pinch noise ~1 px after smoothing) — but it is now the **reference/validation
-oracle**, not the product. The skeleton engine is Monado's **Mercury**, fed by
-our `leap_open` Monado driver. See **`ARCHITECTURE.md`** for the stack decision
-(why Mercury over our own pipeline and over the closed Ultraleap stack, what
-Mercury outputs, and the open LeapC-shim-vs-native question for niri).
+**Multi-sensor architecture (Oct 2026):** OpenMotion is evolving from a
+single-device Leap driver into a **universal sensor driver and detector
+platform**. The four-layer model (L0 raw transport → L1 PoseFrame geometry →
+L2 derived semantics → L3 gesture events) is documented in `ARCHITECTURE.md`.
+Any sensor that can produce hand joint positions plugs in as a Source, and
+the shared L2 layer computes pinch/grab/extension identically for all.
 
-Next: decide the niri integration API (LeapC shim vs. native joint set), tune
-Mercury jitter, gesture signal extraction (pinch/grab/swipe with hysteresis)
-into niri, and upstream the `leap_open` driver to Monado.
+| Component | Status |
+|-----------|--------|
+| **Leap Motion IR driver** | Working (bulk-transfer init-ordering fix in testing) |
+| **V4L2 webcam capture** | Built (640x480 YUYV, pure ctypes, no OpenCV) |
+| **WebcamPoseSolver** (ONNX) | Building (MediaPipe palm detection + hand landmark) |
+| **Multi-sensor fusion** | Built (temporal matching + weighted joint merge) |
+| **Extrinsic calibration** | Building (hand-landmark self-calibration via solvePnP) |
+| **PoseFrame SDK types** | Building (26 OpenXR joints + capability flags) |
+| **Sensor auto-detection** | Building (USB + V4L2 enumeration) |
+| **Cross-platform** | Researched (Windows Media Foundation, macOS AVFoundation) |
+
+Our own 2D + 3D Python pipeline remains the **reference/validation oracle**.
+The skeleton engine is Monado's **Mercury**, fed by our `leap_open` Monado
+driver. See **`ARCHITECTURE.md`** for the full stack decision and the
+multi-sensor architecture.
