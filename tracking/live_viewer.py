@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from skeleton import run as run_skeleton, load_models, triangulate  # noqa: E402
 from skeleton import BONES as SKEL_BONES  # noqa: E402
 import calibration as calib_mod  # noqa: E402
+from pose_frame import joints_mp21_to_oxr26, Pose, derive_semantics  # noqa: E402
 
 try:
     from kinematic import HandFitter, load_lengths as load_bone_lengths
@@ -254,10 +255,15 @@ class Inference(threading.Thread):
             use = fitted if fitted is not None else xyz
             pinch = float(np.linalg.norm(use[4] - use[8]))  # thumbtip-indextip
             depth = float(np.nanmedian(use[:, 2]))
+            # SDK semantics: 21 MP joints (mm) → 26 OXR (m) → derive
+            oxr = joints_mp21_to_oxr26(use / 1000.0)
+            sem = derive_semantics(Pose(joints=oxr))
             entry.update({"pinch_mm": round(pinch, 1),
                           "depth_mm": round(depth, 1),
                           "valid": int(valid.sum()),
                           "kin": fitted is not None,
+                          "grab": round(sem["grab_strength"], 2),
+                          "extended": sem["extended"],
                           "xyz": [[round(float(v), 1) for v in p] for p in use]})
             hands3d.append(entry)
         sampler = self.bone_sampler
@@ -812,8 +818,16 @@ class Viewer(Gtk.Application):
                 for h in info.get("hands3d", []):
                     kin = "·kin" if h.get("kin") else ""
                     rms = f", rms {h['rms_mm']:.0f}" if "rms_mm" in h else ""
-                    tri += (f" | 3D{kin}: pinch {h['pinch_mm']:.0f}mm "
-                            f"depth {h['depth_mm']:.0f}mm ({h['valid']}/21{rms})")
+                    ext = h.get("extended")
+                    fingers = ""
+                    if ext is not None:
+                        fingers = " [" + "".join(
+                            c if e else c.lower()
+                            for c, e in zip("TIMRL", ext)) + "]"
+                    grab = f" grab={h['grab']:.0%}" if "grab" in h else ""
+                    tri += (f" | 3D{kin}: pinch {h['pinch_mm']:.0f}mm{grab}"
+                            f"{fingers} depth {h['depth_mm']:.0f}mm"
+                            f" ({h['valid']}/21{rms})")
                 self.status.set_text(
                     f"device {self._dev_fps:.0f} fps | infer {self._fps:.0f} fps | "
                     f"hand_exists={ex:.2f} kp_conf={kc:.2f} | {orient_str}{tri}"

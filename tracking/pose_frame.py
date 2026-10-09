@@ -146,6 +146,40 @@ def _finger_curl(joints: Tuple[Joint, ...], finger: str) -> float:
     return max(0.0, min(1.0, (1.0 - cos_a) / 2.0))
 
 
+def joints_mp21_to_oxr26(positions) -> 'Tuple[Joint, ...]':
+    """Map 21 MediaPipe joints to 26 OpenXR joints.
+
+    positions: indexable of 21 (x,y,z) — tuples, lists, or numpy rows.
+    Returns tuple of 26 Joint objects in JOINT_NAMES order.
+    Synthesizes 5 metacarpals as wrist↔proximal midpoints and palm as
+    wrist↔middle_MCP midpoint.
+    """
+    p = positions
+
+    def mid(a, b):
+        return ((a[0]+b[0])/2, (a[1]+b[1])/2, (a[2]+b[2])/2)
+
+    def t(x):
+        return (float(x[0]), float(x[1]), float(x[2]))
+
+    j = [None] * 26
+    j[0] = Joint(position=mid(p[0], p[9]), valid=True)   # palm
+    j[1] = Joint(position=t(p[0]), valid=True)            # wrist
+    # thumb: MP CMC(1) MCP(2) IP(3) tip(4) → OXR metacarpal proximal distal tip
+    for oxr, mp in ((2, 1), (3, 2), (4, 3), (5, 4)):
+        j[oxr] = Joint(position=t(p[mp]), valid=True)
+    # index/middle/ring/little: MP has MCP PIP DIP tip (4)
+    # OXR adds metacarpal (wrist↔MCP midpoint) before them (5)
+    for fi, mp0 in enumerate((5, 9, 13, 17)):
+        base = 6 + fi * 5
+        j[base] = Joint(position=mid(p[0], p[mp0]), valid=True)      # metacarpal
+        j[base+1] = Joint(position=t(p[mp0]), valid=True)            # proximal
+        j[base+2] = Joint(position=t(p[mp0+1]), valid=True)          # intermediate
+        j[base+3] = Joint(position=t(p[mp0+2]), valid=True)          # distal
+        j[base+4] = Joint(position=t(p[mp0+3]), valid=True)          # tip
+    return tuple(j)
+
+
 def derive_semantics(pose: Pose) -> dict:
     """Derive gesture semantics from a Pose's joint positions.
 
