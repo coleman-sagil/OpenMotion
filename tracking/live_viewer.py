@@ -212,6 +212,8 @@ class Viewer(Gtk.Application):
         self._fps = self._dev_fps = 0.0
         self._last_shown_n = -1
         self._gain = 1.0
+        self._sensors = []
+        self._sensor_dd = None
 
     def do_activate(self):
         win = Gtk.ApplicationWindow(application=self, title="OpenMotion Viewer")
@@ -233,6 +235,17 @@ class Viewer(Gtk.Application):
         ctrl.set_margin_start(8); ctrl.set_margin_end(8); ctrl.set_margin_bottom(8)
         box.append(ctrl)
 
+        ctrl.append(Gtk.Label(label="sensor"))
+        self._sensor_dd = Gtk.DropDown.new_from_strings(["(scanning…)"])
+        self._sensor_dd.set_size_request(200, -1)
+        self._sensor_dd.connect("notify::selected", self._on_sensor_changed)
+        ctrl.append(self._sensor_dd)
+
+        rescan = Gtk.Button(label="rescan")
+        rescan.set_tooltip_text("Re-detect sensors (plug/unplug without restarting)")
+        rescan.connect("clicked", lambda _: self._rescan_sensors())
+        ctrl.append(rescan)
+
         ctrl.append(Gtk.Label(label="gain"))
         gain = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, 4.0, 0.5)
         gain.set_value(1.0); gain.set_size_request(110, -1)
@@ -249,18 +262,47 @@ class Viewer(Gtk.Application):
         win.present()
 
         self._fps_t = self._dev_t = GLib.get_monotonic_time()
-        self._start_source()
+        self._rescan_sensors()
         GLib.timeout_add(20, self._tick)
 
-    def _start_source(self):
-        devpath = self._webcam_dev
-        if devpath is None:
-            sensors = detect_sensors()
-            webcams = [s for s in sensors if s.type == "webcam"]
-            if not webcams:
-                self.status.set_text("No webcam found — plug one in and restart")
-                return
-            devpath = webcams[0].device_path
+    def _rescan_sensors(self):
+        self._stop_capture()
+        self._sensors = [s for s in detect_sensors() if s.device_path and
+                         s.device_path.startswith("/dev/")]
+        if not self._sensors:
+            names = ["(no sensors found)"]
+        else:
+            names = [f"{s.name} ({s.device_path})" for s in self._sensors]
+        model = Gtk.StringList.new(names)
+        self._sensor_dd.set_model(model)
+        preselect = 0
+        if self._webcam_dev:
+            for i, s in enumerate(self._sensors):
+                if s.device_path == self._webcam_dev:
+                    preselect = i
+                    break
+        self._sensor_dd.set_selected(preselect)
+        if self._sensors:
+            self._start_source(self._sensors[preselect].device_path)
+        else:
+            self.status.set_text("No sensors found — plug one in and hit rescan")
+
+    def _on_sensor_changed(self, dd, _pspec):
+        idx = dd.get_selected()
+        if idx < len(self._sensors):
+            self._stop_capture()
+            self._start_source(self._sensors[idx].device_path)
+
+    def _stop_capture(self):
+        if self.infer:
+            self.infer.stop()
+            self.infer = None
+        if self.reader:
+            self.reader.stop()
+            self.reader = None
+        self._last_shown_n = -1
+
+    def _start_source(self, devpath):
         self.status.set_text(f"Opening {devpath}…")
         try:
             self.reader = V4L2Reader(devpath)
@@ -268,7 +310,7 @@ class Viewer(Gtk.Application):
             self.infer = WebcamInference(self.reader)
             self.infer.start()
         except Exception as e:
-            self.status.set_text(f"Webcam failed: {e}")
+            self.status.set_text(f"Sensor failed: {e}")
 
     def _tick(self):
         if self.infer is None:
@@ -339,7 +381,7 @@ class Viewer(Gtk.Application):
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="OpenMotion live hand-tracking viewer")
-    p.add_argument("--device", help="V4L2 device path (auto-detected if omitted)")
+    p.add_argument("--device", help="V4L2 device path to open first (auto-detected if omitted)")
     args = p.parse_args()
     app = Viewer()
     if args.device:
