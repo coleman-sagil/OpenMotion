@@ -276,6 +276,32 @@ negotiated dwMaxVideoFrameSize={max_frame} dwMaxPayloadTransferSize={max_payload
     // clear any stale halt condition on the bulk endpoint before reading
     let _ = handle.clear_halt(BULK_IN_EP);
 
+    // [diag] read back the commit state to verify the device accepted streaming
+    {
+        let mut rbuf = [0u8; UVC_STREAMING_CONTROL_LEN];
+        match handle.read_control(0xa1, 0x81, VS_COMMIT_CONTROL << 8, u16::from(VS_IFACE),
+                                   &mut rbuf, Duration::from_millis(500)) {
+            Ok(n) => {
+                let fmt = if n > 2 { rbuf[2] } else { 0 };
+                let frm = if n > 3 { rbuf[3] } else { 0 };
+                let max_frame = if n >= 22 { u32::from_le_bytes(rbuf[18..22].try_into().unwrap()) } else { 0 };
+                println!("  [diag] commit GET_CUR readback: {n} bytes, format={fmt} frame={frm} maxFrameSize={max_frame}");
+                println!("  [diag] commit raw: {}", rbuf[..n].iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(""));
+            }
+            Err(e) => println!("  [diag] commit GET_CUR readback FAILED: {e:?}"),
+        }
+    }
+
+    // [diag] try reading interrupt endpoint 0x82 for UVC status events
+    {
+        let mut ibuf = [0u8; 64];
+        match handle.read_interrupt(0x82, &mut ibuf, Duration::from_millis(200)) {
+            Ok(n) => println!("  [diag] interrupt ep 0x82: {n} bytes: {:02x?}", &ibuf[..n]),
+            Err(rusb::Error::Timeout) => println!("  [diag] interrupt ep 0x82: timeout (no pending status)"),
+            Err(e) => println!("  [diag] interrupt ep 0x82: {e:?}"),
+        }
+    }
+
     // ---- stream: frame-synced bulk read + closed-loop auto-exposure ---------
     println!("\nstreaming bulk 0x{BULK_IN_EP:02x} for {secs}s (frame-sync + auto-exposure)...");
 
@@ -1275,26 +1301,59 @@ fn unbind_uvcvideo() {
 #[cfg(not(target_os = "linux"))]
 fn unbind_uvcvideo() {}
 
-/// Windows: power-cycle the Leap Motion USB device by disabling and
-/// re-enabling it. Unlike pnputil /restart-device (which is a PnP-level
-/// restart that doesn't reset the firmware), Disable-PnpDevice + Enable
-/// forces the USB hub to drop VBUS/reset the port, giving us the real
-/// bus-level reset the Leap firmware needs mid-init.
+/// Windows: power-cycle the Leap Motion's USB port via the parent hub.
+///
+/// Sends IOCTL_USB_HUB_CYCLE_PORT to the hub that the device is connected to.
+/// Currently unused — CYCLE_PORT power-cycles the port (firmware cold boots,
+/// losing pre-reset state). Kept for future investigation with KMDF/usbdk.
+#[allow(dead_code)]
+/// Sends IOCTL_USB_HUB_CYCLE_PORT to the hub that the device is connected to,
+/// which toggles the USB bus signals (D+/D- held low) — a real hardware reset
+/// that makes the Leap firmware reinitialize. This is the Windows equivalent of
+/// Linux's `libusb_reset_device` → `ioctl(USBDEVFS_RESET)`.
+///
+/// Requires Administrator (the hub IOCTL needs write access to the hub device).
+/// Falls back to pnputil /restart-device if the hub cycle fails.
 #[cfg(target_os = "windows")]
 fn win_restart_usb_device() {
-    use std::process::Command;
-    // Find the USB composite device instance ID for VID_F182
-    let find = Command::new("powershell")
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Devices::DeviceAndDriverInstallation::*;
+    use windows::Win32::Devices::Properties::*;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::core::PCWSTR;
+
+    // IOCTL_USB_HUB_CYCLE_PORT = CTL_CODE(FILE_DEVICE_USB=0x22, 273, METHOD_BUFFERED, FILE_ANY_ACCESS)
+    const IOCTL_USB_HUB_CYCLE_PORT: u32 = (0x22 << 16) | (273 << 2);
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct UsbCyclePortParams {
+        connection_index: u32,
+        status_returned: u32,
+    }
+
+    // {F18A0E88-C30C-11D0-8815-00A0C906BED8}
+    let guid_usb_hub = windows::core::GUID::from_values(
+        0xF18A0E88, 0xC30C, 0x11D0, [0x88, 0x15, 0x00, 0xA0, 0xC9, 0x06, 0xBE, 0xD8],
+    );
+
+    // Find the Leap's composite device instance ID via PowerShell (cfgmgr32
+    // device enumeration in pure Rust is verbose; this is the pragmatic path)
+    let instance_id = match std::process::Command::new("powershell")
         .args([
             "-NoProfile", "-Command",
             "Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_F182&PID_0003' -and $_.Class -eq 'USB' -and $_.Status -eq 'OK' } | Select-Object -First 1 -ExpandProperty InstanceId",
         ])
-        .output();
-    let instance_id = match find {
+        .output()
+    {
         Ok(out) => {
             let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if id.is_empty() {
-                eprintln!("  [diag] win_restart: no composite device found; falling back to pnputil");
+                eprintln!("  [diag] win_restart: no composite device found");
                 return;
             }
             id
@@ -1304,28 +1363,187 @@ fn win_restart_usb_device() {
             return;
         }
     };
-    eprintln!("  [diag] win_restart: disable/enable cycle on {instance_id}");
-    let script = format!(
-        "Disable-PnpDevice -InstanceId '{}' -Confirm:$false; Start-Sleep -Milliseconds 500; Enable-PnpDevice -InstanceId '{}' -Confirm:$false",
-        instance_id, instance_id
-    );
-    match Command::new("powershell").args(["-NoProfile", "-Command", &script]).output() {
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.is_empty() {
-                eprintln!("  [diag] win_restart: disable/enable cycle completed");
-            } else {
-                // Disable-PnpDevice may need elevation; fall back to pnputil
-                eprintln!("  [diag] win_restart: disable/enable failed: {}", stderr.trim());
-                eprintln!("  [diag] win_restart: falling back to pnputil /restart-device");
-                let _ = Command::new("pnputil").args(["/restart-device", &instance_id]).output();
+
+    let wide_id: Vec<u16> = instance_id.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // 1. Locate the device node
+    let mut node: u32 = 0;
+    let cr = unsafe { CM_Locate_DevNodeW(&mut node, PCWSTR(wide_id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) };
+    if cr.0 != 0 {
+        eprintln!("  [diag] win_restart: CM_Locate_DevNode failed: {}", cr.0);
+        fallback_pnputil(&instance_id);
+        return;
+    }
+
+    // 2. Walk up the device tree to find the parent USB hub and the port index
+    let mut connection_index: u32 = 0;
+    let mut hub_node: u32 = node;
+    let mut found_hub = false;
+
+    for _ in 0..16 {
+        let mut svc_buf = vec![0u16; 256];
+        let mut svc_len = (svc_buf.len() * 2) as u32;
+        let mut prop_type: DEVPROPTYPE = DEVPROPTYPE(0);
+
+        let cr = unsafe {
+            CM_Get_DevNode_PropertyW(
+                hub_node,
+                &DEVPKEY_Device_Service,
+                &mut prop_type,
+                Some(svc_buf.as_mut_ptr() as *mut u8),
+                &mut svc_len,
+                0,
+            )
+        };
+        if cr.0 == 0 {
+            let svc_str = OsString::from_wide(
+                &svc_buf[..svc_buf.iter().position(|&c| c == 0).unwrap_or(svc_buf.len())]
+            );
+            let svc_upper = svc_str.to_string_lossy().to_uppercase();
+            if svc_upper.contains("USBHUB") {
+                found_hub = true;
+                break;
             }
         }
-        Err(e) => {
-            eprintln!("  [diag] win_restart: powershell failed: {e}; trying pnputil");
-            let _ = Command::new("pnputil").args(["/restart-device", &instance_id]).output();
+
+        // Read the connection index (port number) before moving up
+        let mut addr: u32 = 0;
+        let mut addr_len = 4u32;
+        let cr = unsafe {
+            CM_Get_DevNode_PropertyW(
+                hub_node,
+                &DEVPKEY_Device_Address,
+                &mut prop_type,
+                Some(&mut addr as *mut u32 as *mut u8),
+                &mut addr_len,
+                0,
+            )
+        };
+        if cr.0 == 0 {
+            connection_index = addr;
         }
+
+        // Move to parent
+        let mut parent: u32 = 0;
+        if unsafe { CM_Get_Parent(&mut parent, hub_node, 0) }.0 != 0 {
+            break;
+        }
+        hub_node = parent;
     }
+
+    if !found_hub || connection_index == 0 {
+        eprintln!("  [diag] win_restart: could not find hub/port (hub={found_hub} port={connection_index})");
+        fallback_pnputil(&instance_id);
+        return;
+    }
+
+    eprintln!("  [diag] win_restart: found hub node, device on port {connection_index}");
+
+    // 3. Get the hub's device interface path
+    let mut hub_id_buf = vec![0u16; 256];
+    let cr = unsafe { CM_Get_Device_IDW(hub_node, &mut hub_id_buf, 0) };
+    if cr.0 != 0 {
+        eprintln!("  [diag] win_restart: CM_Get_Device_IDW failed: {}", cr.0);
+        fallback_pnputil(&instance_id);
+        return;
+    }
+
+    let mut iface_list_size: u32 = 0;
+    let cr = unsafe {
+        CM_Get_Device_Interface_List_SizeW(
+            &mut iface_list_size,
+            &guid_usb_hub,
+            PCWSTR(hub_id_buf.as_ptr()),
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        )
+    };
+    if cr.0 != 0 || iface_list_size == 0 {
+        eprintln!("  [diag] win_restart: CM_Get_Device_Interface_List_SizeW failed: {}", cr.0);
+        fallback_pnputil(&instance_id);
+        return;
+    }
+
+    let mut iface_list = vec![0u16; iface_list_size as usize];
+    let cr = unsafe {
+        CM_Get_Device_Interface_ListW(
+            &guid_usb_hub,
+            PCWSTR(hub_id_buf.as_ptr()),
+            &mut iface_list,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        )
+    };
+    if cr.0 != 0 {
+        eprintln!("  [diag] win_restart: CM_Get_Device_Interface_ListW failed: {}", cr.0);
+        fallback_pnputil(&instance_id);
+        return;
+    }
+
+    let hub_path_len = iface_list.iter().position(|&c| c == 0).unwrap_or(0);
+    if hub_path_len == 0 {
+        eprintln!("  [diag] win_restart: empty hub interface path");
+        fallback_pnputil(&instance_id);
+        return;
+    }
+    let hub_path: Vec<u16> = iface_list[..=hub_path_len].to_vec(); // include null
+
+    // 4. Open the hub and send IOCTL_USB_HUB_CYCLE_PORT
+    let hub_handle: windows::Win32::Foundation::HANDLE = match unsafe {
+        CreateFileW(
+            PCWSTR(hub_path.as_ptr()),
+            0xC0000000, // GENERIC_READ | GENERIC_WRITE
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("  [diag] win_restart: CreateFileW on hub failed: {e} (need admin?)");
+            fallback_pnputil(&instance_id);
+            return;
+        }
+    };
+
+    let mut params = UsbCyclePortParams {
+        connection_index,
+        status_returned: 0,
+    };
+    let mut returned: u32 = 0;
+    let ioctl_ok = unsafe {
+        DeviceIoControl(
+            hub_handle,
+            IOCTL_USB_HUB_CYCLE_PORT,
+            Some(&params as *const _ as *const std::ffi::c_void),
+            std::mem::size_of::<UsbCyclePortParams>() as u32,
+            Some(&mut params as *mut _ as *mut std::ffi::c_void),
+            std::mem::size_of::<UsbCyclePortParams>() as u32,
+            Some(&mut returned),
+            None,
+        )
+        .is_ok()
+    };
+
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(hub_handle).ok() };
+
+    if ioctl_ok && params.status_returned == 0 {
+        eprintln!("  [diag] win_restart: USB hub port {connection_index} cycled successfully");
+    } else if ioctl_ok {
+        eprintln!("  [diag] win_restart: IOCTL ok but status_returned={}", params.status_returned);
+    } else {
+        eprintln!("  [diag] win_restart: DeviceIoControl failed");
+        fallback_pnputil(&instance_id);
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+fn fallback_pnputil(instance_id: &str) {
+    eprintln!("  [diag] win_restart: falling back to pnputil /restart-device");
+    let _ = std::process::Command::new("pnputil")
+        .args(["/restart-device", instance_id])
+        .output();
 }
 
 /// On Linux: detach the kernel driver (uvcvideo) if bound, then claim.
@@ -1394,6 +1612,7 @@ fn open_claimed() -> rusb::Result<DeviceHandle<Context>> {
 /// success, firmware-state-level no-op. See reverse-engineering/FINDINGS.md
 /// (open question: "does the 55->56 re-enumeration matter") and
 /// reverse-engineering/leap_init_sequence.json entries 49-69.
+#[cfg(not(target_os = "windows"))]
 const RESET_SPLIT: usize = 52;
 
 /// Bring the device up the way leapd's captured init actually does it: the
@@ -1411,75 +1630,83 @@ const RESET_SPLIT: usize = 52;
 fn bring_up_with_reset(seq: &[Transfer]) -> rusb::Result<(DeviceHandle<Context>, usize)> {
     unbind_uvcvideo();
 
-    let pre = &seq[..RESET_SPLIT.min(seq.len())];
-    let post = &seq[(RESET_SPLIT + 1).min(seq.len())..]; // skip the stray SET_INTERFACE marker at RESET_SPLIT
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: no user-mode API can send a real USB PORT_RESET (hub-level
+        // D+/D- signal toggle) without power-cycling the port. The Leap firmware
+        // needs this reset between transfer groups 0-51 and 53-357 to transition
+        // to streaming state. Approaches tried and failed:
+        //   - handle.reset(): WinUSB pipe-level only (AbortPipe/ResetPipe)
+        //   - IOCTL_USB_HUB_CYCLE_PORT: power-cycles port, firmware cold boots
+        //   - pnputil /restart-device: PnP driver restart, no bus signal
+        //   - pnputil /remove-device + /scan-devices: PnP removal, no reset
+        //   - SET_CONFIGURATION(0→1): WinUSB returns NotFound
+        //   - No-reset all-transfers: firmware doesn't transition
+        //
+        // Until a KMDF driver or usbdk is used for IOCTL_INTERNAL_USB_RESET_PORT,
+        // bulk streaming from the Leap on Windows is blocked. The webcam path
+        // (WebcamPoseSolver via camera_cv) works as an alternative.
+        //
+        // Replay all transfers on the same handle (best effort without bus reset).
+        eprintln!("  [diag] win: no USB bus reset available — replaying all {} transfers on same handle", seq.len());
+        eprintln!("  [diag] win: Leap bulk streaming requires a kernel driver (KMDF/usbdk) for PORT_RESET");
+        let handle = open_claimed()?;
+        let replayed = replay_seq(&handle, seq);
+        eprintln!("  [diag] win: {replayed}/{} transfers accepted", seq.len());
+        let _ = handle.clear_halt(BULK_IN_EP);
+        return Ok((handle, replayed));
+    }
 
-    let handle = open_claimed()?;
-    let mut replayed = replay_seq(&handle, pre);
-
-    // The mid-sequence USB port reset is critical: the Leap firmware needs it
-    // to transition from the pre-init to the streaming-ready state. On Linux
-    // libusb_reset_device does a real bus reset; on Windows the WinUSB backend
-    // can't, so we use pnputil to restart the device node (equivalent effect).
     #[cfg(not(target_os = "windows"))]
     {
+        let pre = &seq[..RESET_SPLIT.min(seq.len())];
+        let post = &seq[(RESET_SPLIT + 1).min(seq.len())..];
+
+        let handle = open_claimed()?;
+        let mut replayed = replay_seq(&handle, pre);
+
         match handle.reset() {
             Ok(()) | Err(rusb::Error::NotFound) => {}
             Err(e) => return Err(e),
         }
-    }
-    drop(handle);
+        drop(handle);
 
-    #[cfg(target_os = "windows")]
-    {
-        win_restart_usb_device();
-    }
-
-    // Re-enumeration isn't instantaneous; poll rather than assuming one
-    // fixed delay is enough (or wastefully long) on every machine.
-    let mut new_handle = None;
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(150));
-        if let Ok(h) = open_claimed() {
-            new_handle = Some(h);
-            break;
+        let mut new_handle = None;
+        for attempt in 0..30 {
+            std::thread::sleep(Duration::from_millis(200));
+            match open_claimed() {
+                Ok(h) => {
+                    eprintln!("  [diag] device re-appeared after {:.1}s", (attempt + 1) as f64 * 0.2);
+                    new_handle = Some(h);
+                    break;
+                }
+                Err(_) => {}
+            }
         }
-    }
-    let mut handle = new_handle.ok_or(rusb::Error::NoDevice)?;
+        let mut handle = new_handle.ok_or(rusb::Error::NoDevice)?;
 
-    // Re-selecting the same configuration value is a legitimate, spec-defined
-    // way to force every interface's alt-setting and endpoint halt state back
-    // to default (USB 2.0 spec 9.4.7) -- almost certainly why leapd's capture
-    // does it here, right after the port reset. But issuing SET_CONFIGURATION
-    // while we ourselves hold a usbfs claim on interface 0 (from the
-    // `open_claimed()` call just above) logs a kernel warning
-    // ("usbfs: interface 0 claimed by usbfs while 'openleap' sets config #1")
-    // -- confirmed live on 7.2.2-1-cachyos, 2026-09-12, not present in any
-    // prior investigation note. Release our claims first so the
-    // reconfiguration actually lands cleanly, then re-claim to keep replaying.
-    // Unbind uvcvideo again — it re-binds after the USB reset above.
-    unbind_uvcvideo();
+        unbind_uvcvideo();
 
-    for iface in [VC_IFACE, VS_IFACE] {
-        let _ = handle.release_interface(iface);
-    }
-    let _ = handle.set_active_configuration(1); // first SET_CONFIGURATION(1) -- mirrors leapd entry 62
-    for iface in [VC_IFACE, VS_IFACE] {
-        detach_and_claim(&mut handle, iface)?;
-    }
-    let _ = handle.set_alternate_setting(VS_IFACE, 0);
-    // leapd's capture shows a second SET_CONFIGURATION(1) (entry 68) after
-    // SET_INTERFACE and some hub operations. Release/reclaim to do it cleanly.
-    for iface in [VC_IFACE, VS_IFACE] {
-        let _ = handle.release_interface(iface);
-    }
-    let _ = handle.set_active_configuration(1); // second SET_CONFIGURATION(1) -- mirrors leapd entry 68
-    for iface in [VC_IFACE, VS_IFACE] {
-        detach_and_claim(&mut handle, iface)?;
-    }
+        for iface in [VC_IFACE, VS_IFACE] {
+            let _ = handle.release_interface(iface);
+        }
+        let _ = handle.set_active_configuration(1);
+        for iface in [VC_IFACE, VS_IFACE] {
+            detach_and_claim(&mut handle, iface)?;
+        }
+        let _ = handle.set_alternate_setting(VS_IFACE, 0);
+        for iface in [VC_IFACE, VS_IFACE] {
+            let _ = handle.release_interface(iface);
+        }
+        let _ = handle.set_active_configuration(1);
+        for iface in [VC_IFACE, VS_IFACE] {
+            detach_and_claim(&mut handle, iface)?;
+        }
 
-    replayed += replay_seq(&handle, post);
-    Ok((handle, replayed))
+        let _ = handle.clear_halt(BULK_IN_EP);
+        replayed += replay_seq(&handle, post);
+        Ok((handle, replayed))
+    }
 }
 
 /// Replay leapd's extension-unit bring-up control writes; returns how many the
