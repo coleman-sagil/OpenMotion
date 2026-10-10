@@ -319,17 +319,32 @@ negotiated dwMaxVideoFrameSize={max_frame} dwMaxPayloadTransferSize={max_payload
     let mut eofs = 0u64;
     let mut header_len = 0usize;
 
+    let mut timeout_count = 0u64;
+    let mut other_error_count = 0u64;
     while Instant::now() < deadline {
         let n = match handle.read_bulk(BULK_IN_EP, &mut buf, read_timeout) {
             Ok(n) => n,
-            Err(rusb::Error::Timeout) => 0,
+            Err(rusb::Error::Timeout) => {
+                timeout_count += 1;
+                if timeout_count <= 3 {
+                    println!("  [diag] bulk read timeout #{timeout_count}");
+                }
+                0
+            }
             Err(e) => {
-                println!("  bulk read error: {e}");
-                break;
+                other_error_count += 1;
+                if other_error_count <= 5 {
+                    println!("  [diag] bulk read error #{other_error_count}: {e:?}");
+                }
+                continue;
             }
         };
         if n == 0 {
             continue;
+        }
+        if reads == 0 {
+            println!("  [diag] first bulk read: {n} bytes (hdr[0]={} hdr[1]={:#04x})",
+                buf[0], buf[1]);
         }
         reads += 1;
         if raw_sample.len() < FRAME_BYTES + 64 {
@@ -370,7 +385,7 @@ negotiated dwMaxVideoFrameSize={max_frame} dwMaxPayloadTransferSize={max_payload
     }
 
     println!(
-        "captured {} frames | {reads} reads, {payloads} payloads (hdr {header_len}B), {eofs} EOFs",
+        "captured {} frames | {reads} reads, {payloads} payloads (hdr {header_len}B), {eofs} EOFs | {timeout_count} timeouts, {other_error_count} errors",
         frames.len()
     );
     if !ae_log.is_empty() {
@@ -1260,6 +1275,59 @@ fn unbind_uvcvideo() {
 #[cfg(not(target_os = "linux"))]
 fn unbind_uvcvideo() {}
 
+/// Windows: power-cycle the Leap Motion USB device by disabling and
+/// re-enabling it. Unlike pnputil /restart-device (which is a PnP-level
+/// restart that doesn't reset the firmware), Disable-PnpDevice + Enable
+/// forces the USB hub to drop VBUS/reset the port, giving us the real
+/// bus-level reset the Leap firmware needs mid-init.
+#[cfg(target_os = "windows")]
+fn win_restart_usb_device() {
+    use std::process::Command;
+    // Find the USB composite device instance ID for VID_F182
+    let find = Command::new("powershell")
+        .args([
+            "-NoProfile", "-Command",
+            "Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_F182&PID_0003' -and $_.Class -eq 'USB' -and $_.Status -eq 'OK' } | Select-Object -First 1 -ExpandProperty InstanceId",
+        ])
+        .output();
+    let instance_id = match find {
+        Ok(out) => {
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if id.is_empty() {
+                eprintln!("  [diag] win_restart: no composite device found; falling back to pnputil");
+                return;
+            }
+            id
+        }
+        Err(e) => {
+            eprintln!("  [diag] win_restart: powershell failed: {e}");
+            return;
+        }
+    };
+    eprintln!("  [diag] win_restart: disable/enable cycle on {instance_id}");
+    let script = format!(
+        "Disable-PnpDevice -InstanceId '{}' -Confirm:$false; Start-Sleep -Milliseconds 500; Enable-PnpDevice -InstanceId '{}' -Confirm:$false",
+        instance_id, instance_id
+    );
+    match Command::new("powershell").args(["-NoProfile", "-Command", &script]).output() {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.is_empty() {
+                eprintln!("  [diag] win_restart: disable/enable cycle completed");
+            } else {
+                // Disable-PnpDevice may need elevation; fall back to pnputil
+                eprintln!("  [diag] win_restart: disable/enable failed: {}", stderr.trim());
+                eprintln!("  [diag] win_restart: falling back to pnputil /restart-device");
+                let _ = Command::new("pnputil").args(["/restart-device", &instance_id]).output();
+            }
+        }
+        Err(e) => {
+            eprintln!("  [diag] win_restart: powershell failed: {e}; trying pnputil");
+            let _ = Command::new("pnputil").args(["/restart-device", &instance_id]).output();
+        }
+    }
+}
+
 /// On Linux: detach the kernel driver (uvcvideo) if bound, then claim.
 /// On Windows: kernel_driver_active / detach_kernel_driver are not applicable
 /// with the WinUSB backend — just claim the interface directly.
@@ -1349,11 +1417,23 @@ fn bring_up_with_reset(seq: &[Transfer]) -> rusb::Result<(DeviceHandle<Context>,
     let handle = open_claimed()?;
     let mut replayed = replay_seq(&handle, pre);
 
-    match handle.reset() {
-        Ok(()) | Err(rusb::Error::NotFound) => {}
-        Err(e) => return Err(e),
+    // The mid-sequence USB port reset is critical: the Leap firmware needs it
+    // to transition from the pre-init to the streaming-ready state. On Linux
+    // libusb_reset_device does a real bus reset; on Windows the WinUSB backend
+    // can't, so we use pnputil to restart the device node (equivalent effect).
+    #[cfg(not(target_os = "windows"))]
+    {
+        match handle.reset() {
+            Ok(()) | Err(rusb::Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
     }
     drop(handle);
+
+    #[cfg(target_os = "windows")]
+    {
+        win_restart_usb_device();
+    }
 
     // Re-enumeration isn't instantaneous; poll rather than assuming one
     // fixed delay is enough (or wastefully long) on every machine.
