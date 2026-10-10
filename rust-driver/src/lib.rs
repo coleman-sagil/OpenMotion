@@ -1264,6 +1264,7 @@ fn unbind_uvcvideo() {}
 /// On Windows: kernel_driver_active / detach_kernel_driver are not applicable
 /// with the WinUSB backend — just claim the interface directly.
 fn detach_and_claim<T: UsbContext>(handle: &mut DeviceHandle<T>, iface: u8) -> rusb::Result<bool> {
+    #[allow(unused_mut)]
     let mut detached = false;
     #[cfg(target_os = "linux")]
     if handle.kernel_driver_active(iface).unwrap_or(false) {
