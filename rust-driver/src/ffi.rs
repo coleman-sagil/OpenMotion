@@ -18,8 +18,8 @@ use std::thread::JoinHandle;
 use rusb::{Context, DeviceHandle};
 
 use crate::{
-    drain_usb, open_claimed, parse_seq, read_calibration, replay_seq, set_exposure, set_leds,
-    Counters, DiagPrev, Mailbox, StreamState, VC_IFACE, VS_IFACE,
+    drain_usb, open_claimed, parse_seq, read_calibration, release_to_kernel, replay_seq,
+    set_exposure, set_leds, Counters, DiagPrev, Mailbox, StreamState, VC_IFACE, VS_IFACE,
 };
 
 /// On-device calibration size: PU addresses 100..256 -> 156 bytes (matches
@@ -248,11 +248,10 @@ pub unsafe extern "C" fn leap_open_close(h: *mut LeapOpen) {
         }
     }
     // the drain thread's Arc clone is gone after join, so this is the sole
-    // owner and we can hand the interfaces back to the kernel explicitly.
+    // owner and we can hand the interfaces back to the OS explicitly.
     if let Ok(handle) = Arc::try_unwrap(handle) {
         for iface in [VC_IFACE, VS_IFACE] {
-            let _ = handle.release_interface(iface);
-            let _ = handle.attach_kernel_driver(iface);
+            release_to_kernel(&handle, iface);
         }
     }
 }

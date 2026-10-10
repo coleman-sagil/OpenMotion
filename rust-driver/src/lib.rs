@@ -2,14 +2,17 @@
 //! the way leapd does (bulk image transport + UVC extension-unit control),
 //! bypassing the closed daemon.
 //!
-//! v0.1 milestone — `info`: open the device, dump its full descriptor tree,
-//! locate the bulk IN (image) endpoint and the VideoControl interface that
-//! owns the vendor extension units, then prove we can take the device away
-//! from the kernel `uvcvideo` driver (detach + claim + release).
+//! Cross-platform: Linux (libusb + uvcvideo detach) and Windows (WinUSB via
+//! Zadig). The USB protocol (init sequence, control transfers, bulk streaming)
+//! is the same on both — only the driver binding and thread priority differ.
+//! See `docs/WINUSB_SETUP.md` for Windows driver installation.
 //!
-//! Run with the Ultraleap service STOPPED (it owns the device otherwise):
+//! Linux: run with the Ultraleap service STOPPED (it owns the device):
 //!   pkexec systemctl stop ultraleap-hand-tracking-service
-//!   sudo ./leap-open info        # claim needs root for detach
+//!   sudo ./openleap info        # claim needs root for detach
+//!
+//! Windows: install WinUSB via Zadig, then run openleap.exe normally (no
+//! elevation needed once the driver is installed).
 //!
 //! The bring-up sequence (bringup_seq.txt) was decoded from a usbmon capture
 //! of leapd -- see reverse-engineering/FINDINGS.md for the full trail.
@@ -170,9 +173,7 @@ fn run_info() -> rusb::Result<()> {
         }
     }
     for iface in &claimed {
-        let _ = handle.release_interface(*iface);
-        // hand the device back to the kernel so normal operation resumes
-        let _ = handle.attach_kernel_driver(*iface);
+        release_to_kernel(&handle, *iface);
     }
     println!(
         "\nclaim test {}.  device released back to kernel.",
@@ -381,10 +382,9 @@ negotiated dwMaxVideoFrameSize={max_frame} dwMaxPayloadTransferSize={max_payload
     }
     let _ = std::fs::write("bulk_sample.raw", &raw_sample);
 
-    // release back to kernel
+    // release back to kernel / OS
     for iface in [VC_IFACE, VS_IFACE] {
-        let _ = handle.release_interface(iface);
-        let _ = handle.attach_kernel_driver(iface);
+        release_to_kernel(&handle, iface);
     }
 
     if frames.len() >= 4 {
@@ -497,8 +497,7 @@ fn run_calib() -> rusb::Result<()> {
     );
 
     for iface in [VC_IFACE, VS_IFACE] {
-        let _ = handle.release_interface(iface);
-        let _ = handle.attach_kernel_driver(iface);
+        release_to_kernel(&handle, iface);
     }
 
     // write raw bytes to stdout for the Python parser
@@ -639,11 +638,10 @@ negotiated frame size {max_frame}B, payload size {max_payload}B)"
     let _ = drain.join();
 
     // the drain thread's handle clone is gone after join, so unwrap succeeds
-    // and we can hand the interfaces back to the kernel explicitly.
+    // and we can hand the interfaces back to the OS explicitly.
     if let Ok(handle) = Arc::try_unwrap(handle) {
         for iface in [VC_IFACE, VS_IFACE] {
-            let _ = handle.release_interface(iface);
-            let _ = handle.attach_kernel_driver(iface);
+            release_to_kernel(&handle, iface);
         }
     }
     eprintln!(
@@ -718,17 +716,16 @@ impl Mailbox {
     }
 }
 
-/// USB drain thread: read bulk payloads and reassemble frames (EOF-delimited,
-/// with FID-toggle recovery when an EOF payload is lost), deposit complete
-/// frames in the mailbox. Does no other I/O, so the endpoint is serviced
-/// continuously and the device FIFO never overflows on our account.
-fn drain_usb<T: UsbContext>(handle: &DeviceHandle<T>, mb: &Mailbox, c: &Counters) {
-    // Real-time priority: a payload arrives every ~470 us, and a normal-
-    // priority thread gets descheduled for milliseconds when the viewer's
-    // inference saturates the CPU — each such delay tears a frame. We run as
-    // root (pkexec), so SCHED_FIFO is available; the drain then preempts any
-    // normal load the instant data is ready. Priority 10 is modest — well
-    // below kernel IRQ threads, above everything SCHED_OTHER.
+/// Elevate the current thread to real-time / time-critical priority so the USB
+/// drain loop is never preempted by the inference workload.
+///
+/// Linux: SCHED_FIFO priority 10 (needs root / pkexec). Modest — well below
+/// kernel IRQ threads, above everything SCHED_OTHER.
+///
+/// Windows: THREAD_PRIORITY_TIME_CRITICAL. Does not require elevation but the
+/// process should be in the HIGH_PRIORITY_CLASS for this to have full effect.
+#[cfg(target_os = "linux")]
+fn elevate_thread_priority() {
     unsafe {
         let param = libc::sched_param { sched_priority: 10 };
         if libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) == 0 {
@@ -737,6 +734,36 @@ fn drain_usb<T: UsbContext>(handle: &DeviceHandle<T>, mb: &Mailbox, c: &Counters
             eprintln!("stream: real-time priority unavailable; continuing best-effort");
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn elevate_thread_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    unsafe {
+        if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL).is_ok() {
+            eprintln!("stream: drain thread at time-critical priority");
+        } else {
+            eprintln!("stream: time-critical priority unavailable; continuing best-effort");
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn elevate_thread_priority() {
+    eprintln!("stream: thread priority elevation not implemented on this platform; continuing best-effort");
+}
+
+/// USB drain thread: read bulk payloads and reassemble frames (EOF-delimited,
+/// with FID-toggle recovery when an EOF payload is lost), deposit complete
+/// frames in the mailbox. Does no other I/O, so the endpoint is serviced
+/// continuously and the device FIFO never overflows on our account.
+fn drain_usb<T: UsbContext>(handle: &DeviceHandle<T>, mb: &Mailbox, c: &Counters) {
+    // Real-time priority: a payload arrives every ~470 us, and a normal-
+    // priority thread gets descheduled for milliseconds when the viewer's
+    // inference saturates the CPU — each such delay tears a frame.
+    elevate_thread_priority();
 
     let read_timeout = Duration::from_millis(500);
     let mut buf = vec![0u8; 64 * 1024];
@@ -1206,6 +1233,10 @@ fn arm_streaming_endpoint<T: UsbContext>(handle: &DeviceHandle<T>) {
 /// doesn't leave stale endpoint state that interferes with our libusb bulk reads.
 /// Runs silently if the driver isn't bound or the sysfs write fails (we'll try
 /// `detach_kernel_driver` later as a fallback).
+///
+/// Linux-only: Windows uses WinUSB (installed via Zadig), which has no kernel
+/// video driver to contend with. On non-Linux this is a no-op.
+#[cfg(target_os = "linux")]
 fn unbind_uvcvideo() {
     let unbind_path = "/sys/bus/usb/drivers/uvcvideo/unbind";
     for entry in std::fs::read_dir("/sys/bus/usb/devices").into_iter().flatten().flatten() {
@@ -1225,14 +1256,31 @@ fn unbind_uvcvideo() {
     }
 }
 
+/// No-op on non-Linux: Windows uses WinUSB, no kernel video driver to unbind.
+#[cfg(not(target_os = "linux"))]
+fn unbind_uvcvideo() {}
+
+/// On Linux: detach the kernel driver (uvcvideo) if bound, then claim.
+/// On Windows: kernel_driver_active / detach_kernel_driver are not applicable
+/// with the WinUSB backend — just claim the interface directly.
 fn detach_and_claim<T: UsbContext>(handle: &mut DeviceHandle<T>, iface: u8) -> rusb::Result<bool> {
     let mut detached = false;
+    #[cfg(target_os = "linux")]
     if handle.kernel_driver_active(iface).unwrap_or(false) {
         handle.detach_kernel_driver(iface)?;
         detached = true;
     }
     handle.claim_interface(iface)?;
     Ok(detached)
+}
+
+/// Hand the device interface back to the kernel driver (Linux) or no-op (Windows).
+pub(crate) fn release_to_kernel<T: UsbContext>(handle: &DeviceHandle<T>, iface: u8) {
+    let _ = handle.release_interface(iface);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = handle.attach_kernel_driver(iface);
+    }
 }
 
 fn open_leap<T: UsbContext>(ctx: &T) -> rusb::Result<(Device<T>, rusb::DeviceDescriptor)> {
