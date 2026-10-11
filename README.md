@@ -24,7 +24,7 @@ grew out of).
 | path | what |
 |---|---|
 | `rust-driver/` | Rust USB driver (libusb/`rusb`): device bring-up, stereo IR streaming, exposure/LED control, calibration reader. Also exports the `leap_open_*` C ABI as `libopenleap.a` for the Monado driver |
-| `tracking/` | Python hand-tracking pipeline (Mercury ONNX inference, live GTK4 viewer, stereo calibration/triangulation) — now the reference/validation oracle, not the product (see `ARCHITECTURE.md`) |
+| `tracking/` | Python SDK + hand-tracking pipeline: `pose_frame.py` (26-joint OpenXR types + `derive_semantics`), `webcam_solver.py` (ONNX palm+landmark), `detect.py` (sensor enumeration), `live_viewer.py` (GTK4 viewer), stereo calibration/triangulation |
 | `monado-driver/` | design/reference docs for the Monado `leap_open` driver — the engine path Leap → Mercury (the built C driver lives in the monado fork) |
 | `reverse-engineering/` | the protocol recon that made the driver possible (usbmon capture analysis, decoded init sequence) — historical record, nothing runs from here |
 | `hand-tracking-models/` | Monado's openly-licensed (CC-BY-SA 4.0) Mercury ONNX models + MediaPipe palm/landmark models — separate git clone, see Setup |
@@ -109,20 +109,21 @@ Per eye, per frame (`skeleton.py`, conventions ported from Monado Mercury's
 inverts Leap's radial distortion model into OpenCV coefficients via curve
 fit, and builds stereo-rectified undistortion maps (`calib.npz`).
 
-`live_viewer.py` is the debug/tuning GUI: live feed + skeleton overlay,
-eye/rotation/flip/undistort controls, IR LED + exposure + AE device controls,
-temporal/skeleton toggles, frame-integrity stats, 3D pinch/depth readout, and
-a **record** mode that saves model inputs + outputs for offline analysis.
+`live_viewer.py` is the OpenMotion Viewer: a GTK4 app that captures from any
+detected sensor (webcam or Leap V4L2 node), runs ONNX hand detection via
+`WebcamPoseSolver`, and shows a live skeleton overlay with per-frame semantic
+readout (pinch %, grab %, finger extension). Sensor dropdown for hot-plug,
+gain slider, snapshot export.
 
 ## Setup
 
 ```bash
-# deps: rust, python3, gtk4 + pygobject (system), polkit
-git clone https://github.com/julianjc84/OpenMotion.git
+# deps: rust, python3, gtk4 + pygobject (system), polkit, uv
+git clone https://github.com/coleman-sagil/OpenMotion.git
 cd OpenMotion
 git clone https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models.git
-python -m venv --system-site-packages .venv
-.venv/bin/pip install onnxruntime opencv-python-headless numpy scipy
+uv venv --system-site-packages .venv
+uv pip install onnxruntime opencv-python-headless numpy scipy
 ( cd rust-driver && cargo build )
 ./run_live.sh        # one polkit prompt: stops any closed leapd, claims the device
 ```
@@ -175,14 +176,14 @@ the shared L2 layer computes pinch/grab/extension identically for all.
 
 | Component | Status |
 |-----------|--------|
-| **Leap Motion IR driver** | Working (bulk-transfer init-ordering fix in testing) |
-| **V4L2 webcam capture** | Built (640x480 YUYV, pure ctypes, no OpenCV) |
-| **WebcamPoseSolver** (ONNX) | Building (MediaPipe palm detection + hand landmark) |
-| **Multi-sensor fusion** | Built (temporal matching + weighted joint merge) |
-| **Extrinsic calibration** | Building (hand-landmark self-calibration via solvePnP) |
-| **PoseFrame SDK types** | Building (26 OpenXR joints + capability flags) |
-| **Sensor auto-detection** | Building (USB + V4L2 enumeration) |
-| **Cross-platform** | Researched (Windows Media Foundation, macOS AVFoundation) |
+| **Leap Motion IR driver** | Working — Linux streaming verified; Windows compiles + enumerates (bus-reset gap blocks streaming) |
+| **V4L2 webcam capture** | Done (640x480 YUYV, pure ctypes, no OpenCV) |
+| **WebcamPoseSolver** (ONNX) | Done — MediaPipe palm detection + hand landmark, ~14ms/frame |
+| **PoseFrame SDK types** | Done — 26 OpenXR joints, canonical `derive_semantics` (pinch/grab/extended) |
+| **Sensor auto-detection** | Done — USB VID/PID + V4L2 enumeration, Leap filtered from webcam list |
+| **Multi-sensor fusion** | Done (temporal matching + weighted joint merge) |
+| **Extrinsic calibration** | In progress (hand-landmark self-calibration via solvePnP) |
+| **Cross-platform** | Windows: Rust driver compiles (MinGW), webcam via OpenCV. macOS: untested |
 
 Our own 2D + 3D Python pipeline remains the **reference/validation oracle**.
 The skeleton engine is Monado's **Mercury**, fed by our `leap_open` Monado
