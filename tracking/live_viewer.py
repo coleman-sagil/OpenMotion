@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""OpenMotion Viewer — live hand tracking from any V4L2 webcam.
+"""OpenMotion Viewer — live hand tracking from any camera.
 
-Uses V4L2 raw capture → WebcamPoseSolver (ONNX BlazePalm + landmarks) →
-PoseFrame SDK types (26-joint OpenXR layout + derive_semantics) → GTK4 display.
+Uses V4L2 raw capture (Linux) or OpenCV (cross-platform) → WebcamPoseSolver
+(ONNX BlazePalm + landmarks) → PoseFrame SDK types (26-joint OpenXR layout +
+derive_semantics) → GTK4/Adw display.
 
 Run:
   .venv/bin/python tracking/live_viewer.py
   .venv/bin/python tracking/live_viewer.py --device /dev/video2
+  python -m tracking --viewer
 """
 
-import fcntl
 import json
-import mmap as mmap_mod
 import os
 import struct
 import sys
@@ -23,13 +23,21 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pose_frame import joints_mp21_to_oxr26, Pose, derive_semantics  # noqa: E402
-from detect import detect_sensors  # noqa: E402
+from device_registry import (  # noqa: E402
+    DeviceManager, LEAP_MOTION, WEBCAM, discover_devices,
+)
 from webcam_solver import WebcamPoseSolver  # noqa: E402
 
 import gi  # noqa: E402
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import GLib, Gdk, Gtk  # noqa: E402
+try:
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw
+    HAS_ADW = True
+except (ValueError, ImportError):
+    HAS_ADW = False
+from gi.repository import GLib, Gdk, Gtk, Gio  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,7 +53,7 @@ V4L2_PIX_FMT_YUYV = 0x56595559
 
 
 class V4L2Reader(threading.Thread):
-    """Captures YUYV frames from a V4L2 device, extracts grayscale."""
+    """Captures YUYV frames from a V4L2 device, extracts grayscale. Linux-only."""
 
     def __init__(self, devpath, width=640, height=480):
         super().__init__(daemon=True)
@@ -57,6 +65,8 @@ class V4L2Reader(threading.Thread):
         self.total = 0
 
     def run(self):
+        import fcntl
+        import mmap as mmap_mod
         import select as sel_mod
         fd = os.open(self.devpath, os.O_RDWR | os.O_NONBLOCK)
         try:
@@ -139,8 +149,51 @@ class V4L2Reader(threading.Thread):
         self.running = False
 
 
+class CvCapture(threading.Thread):
+    """OpenCV capture fallback — works on Linux, Windows, macOS."""
+
+    def __init__(self, device_index=0, width=640, height=480):
+        super().__init__(daemon=True)
+        self.device_index = device_index
+        self.width, self.height = width, height
+        self.lock = threading.Lock()
+        self.latest = None
+        self.running = True
+        self.total = 0
+
+    def run(self):
+        cap = cv2.VideoCapture(self.device_index)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        counter = 0
+        try:
+            while self.running:
+                ok, frame = cap.read()
+                if not ok:
+                    time.sleep(0.01)
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                counter += 1
+                with self.lock:
+                    self.latest = (counter, gray)
+                    self.total += 1
+        finally:
+            cap.release()
+
+    def stats(self):
+        with self.lock:
+            return self.total
+
+    def get(self):
+        with self.lock:
+            return self.latest
+
+    def stop(self):
+        self.running = False
+
+
 class WebcamInference(threading.Thread):
-    """Runs WebcamPoseSolver on V4L2 grayscale frames, produces annotated RGB."""
+    """Runs WebcamPoseSolver on grayscale frames, produces annotated RGB."""
 
     def __init__(self, reader):
         super().__init__(daemon=True)
@@ -201,9 +254,28 @@ class WebcamInference(threading.Thread):
         self.running = False
 
 
-class Viewer(Gtk.Application):
+def _make_reader(device):
+    """Create the right capture thread for a device."""
+    if sys.platform == "linux" and device.device_path.startswith("/dev/video"):
+        return V4L2Reader(device.device_path)
+    idx = 0
+    path = device.device_path
+    if path.startswith("/dev/video"):
+        try:
+            idx = int(path.replace("/dev/video", ""))
+        except ValueError:
+            pass
+    return CvCapture(device_index=idx)
+
+
+AppBase = Adw.Application if HAS_ADW else Gtk.Application
+WinBase = Adw.ApplicationWindow if HAS_ADW else Gtk.ApplicationWindow
+
+
+class Viewer(AppBase):
     def __init__(self):
         super().__init__(application_id="org.openmotion.Viewer")
+        self._devmgr = DeviceManager()
         self._webcam_dev = None
         self.reader = None
         self.infer = None
@@ -212,86 +284,207 @@ class Viewer(Gtk.Application):
         self._fps = self._dev_fps = 0.0
         self._last_shown_n = -1
         self._gain = 1.0
-        self._sensors = []
-        self._sensor_dd = None
+        self._recording = False
+        self._rec_dir = None
+        self._rec_seq = 0
 
     def do_activate(self):
-        win = Gtk.ApplicationWindow(application=self, title="OpenMotion Viewer")
-        win.set_default_size(900, 560)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        win.set_child(box)
+        win = WinBase(application=self, title="OpenMotion Viewer")
+        win.set_default_size(1100, 680)
+
+        # -- outer layout --
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+
+        # == LEFT: device sidebar ==
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        sidebar.set_size_request(220, -1)
+        sidebar.add_css_class("background")
+        sidebar.set_margin_start(6)
+        sidebar.set_margin_top(6)
+        sidebar.set_margin_bottom(6)
+
+        side_label = Gtk.Label(label="Devices")
+        side_label.add_css_class("title-4")
+        side_label.set_xalign(0)
+        side_label.set_margin_start(6)
+        sidebar.append(side_label)
+
+        self._device_list = Gtk.ListBox()
+        self._device_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._device_list.add_css_class("boxed-list")
+        self._device_list.connect("row-selected", self._on_device_selected)
+        scroll_dev = Gtk.ScrolledWindow()
+        scroll_dev.set_vexpand(True)
+        scroll_dev.set_child(self._device_list)
+        sidebar.append(scroll_dev)
+
+        rescan_btn = Gtk.Button(label="Rescan Devices")
+        rescan_btn.connect("clicked", lambda _: self._rescan_devices())
+        rescan_btn.set_margin_start(6)
+        rescan_btn.set_margin_end(6)
+        rescan_btn.set_margin_bottom(6)
+        sidebar.append(rescan_btn)
+
+        sep_l = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        outer.append(sidebar)
+        outer.append(sep_l)
+
+        # == CENTER: camera view + controls ==
+        center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        center.set_hexpand(True)
+
+        # header bar
+        if HAS_ADW:
+            hb = Adw.HeaderBar()
+            hb.set_title_widget(Gtk.Label(label="OpenMotion Viewer"))
+        else:
+            hb = Gtk.HeaderBar()
+            hb.set_title_widget(Gtk.Label(label="OpenMotion Viewer"))
+
+        self._fusion_toggle = Gtk.ToggleButton(label="Fusion")
+        self._fusion_toggle.set_tooltip_text("Show fusion config panel")
+        self._fusion_toggle.connect("toggled", self._on_fusion_toggled)
+        hb.pack_end(self._fusion_toggle)
+        center.append(hb)
 
         self.pic = Gtk.Picture()
         self.pic.set_content_fit(Gtk.ContentFit.CONTAIN)
         self.pic.set_vexpand(True)
         self.pic.set_hexpand(True)
-        box.append(self.pic)
+        center.append(self.pic)
 
+        # status line
         self.status = Gtk.Label(label="detecting sensors…")
         self.status.set_xalign(0.0)
-        box.append(self.status)
+        self.status.set_margin_start(8)
+        self.status.set_margin_end(8)
+        center.append(self.status)
 
-        ctrl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        ctrl.set_margin_start(8); ctrl.set_margin_end(8); ctrl.set_margin_bottom(8)
-        box.append(ctrl)
+        # bottom bar
+        bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        bot.set_margin_start(8)
+        bot.set_margin_end(8)
+        bot.set_margin_top(4)
+        bot.set_margin_bottom(8)
 
-        ctrl.append(Gtk.Label(label="sensor"))
-        self._sensor_dd = Gtk.DropDown.new_from_strings(["(scanning…)"])
-        self._sensor_dd.set_size_request(200, -1)
-        self._sensor_dd.connect("notify::selected", self._on_sensor_changed)
-        ctrl.append(self._sensor_dd)
-
-        rescan = Gtk.Button(label="rescan")
-        rescan.set_tooltip_text("Re-detect sensors (plug/unplug without restarting)")
-        rescan.connect("clicked", lambda _: self._rescan_sensors())
-        ctrl.append(rescan)
-
-        ctrl.append(Gtk.Label(label="gain"))
+        bot.append(Gtk.Label(label="gain"))
         gain = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, 4.0, 0.5)
-        gain.set_value(1.0); gain.set_size_request(110, -1)
+        gain.set_value(1.0)
+        gain.set_size_request(110, -1)
         gain.set_draw_value(True)
         gain.connect("value-changed", lambda s: setattr(self, "_gain", s.get_value()))
-        ctrl.append(gain)
+        bot.append(gain)
 
-        snap = Gtk.Button(label="snapshot")
-        snap.set_tooltip_text("Save annotated frame + info JSON to tracking/snapshots/")
+        snap = Gtk.Button(label="Snapshot")
+        snap.set_tooltip_text("Save annotated frame + info JSON")
         snap.connect("clicked", self._on_snapshot)
-        ctrl.append(snap)
+        bot.append(snap)
 
+        self._rec_btn = Gtk.ToggleButton(label="Record")
+        self._rec_btn.set_tooltip_text("Record frames to tracking/recordings/")
+        self._rec_btn.connect("toggled", self._on_record_toggled)
+        bot.append(self._rec_btn)
+
+        center.append(bot)
+        outer.append(center)
+
+        # == RIGHT: fusion sidebar (collapsible) ==
+        sep_r = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        self._sep_r = sep_r
+        sep_r.set_visible(False)
+        outer.append(sep_r)
+
+        self._fusion_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._fusion_panel.set_size_request(220, -1)
+        self._fusion_panel.set_visible(False)
+        self._fusion_panel.set_margin_end(6)
+        self._fusion_panel.set_margin_top(6)
+        self._fusion_panel.set_margin_bottom(6)
+
+        fp_label = Gtk.Label(label="Fusion Config")
+        fp_label.add_css_class("title-4")
+        fp_label.set_xalign(0)
+        fp_label.set_margin_start(6)
+        self._fusion_panel.append(fp_label)
+
+        self._fusion_panel.append(Gtk.Label(label="Topology"))
+        self._topo_dd = Gtk.DropDown.new_from_strings(
+            ["single", "dual", "quad", "room"])
+        self._topo_dd.set_margin_start(6)
+        self._topo_dd.set_margin_end(6)
+        self._fusion_panel.append(self._topo_dd)
+
+        self._fusion_devices_label = Gtk.Label(label="No devices in fusion")
+        self._fusion_devices_label.set_xalign(0)
+        self._fusion_devices_label.set_margin_start(6)
+        self._fusion_devices_label.set_margin_top(12)
+        self._fusion_devices_label.set_wrap(True)
+        self._fusion_panel.append(self._fusion_devices_label)
+
+        outer.append(self._fusion_panel)
+
+        win.set_content(outer)
         win.connect("close-request", self._on_close)
         win.present()
 
         self._fps_t = self._dev_t = GLib.get_monotonic_time()
-        self._rescan_sensors()
+        self._rescan_devices()
         GLib.timeout_add(20, self._tick)
 
-    def _rescan_sensors(self):
+    def _rescan_devices(self):
         self._stop_capture()
-        self._sensors = [s for s in detect_sensors() if s.device_path and
-                         s.device_path.startswith("/dev/")]
-        if not self._sensors:
-            names = ["(no sensors found)"]
-        else:
-            names = [f"{s.name} ({s.device_path})" for s in self._sensors]
-        model = Gtk.StringList.new(names)
-        self._sensor_dd.set_model(model)
-        preselect = 0
-        if self._webcam_dev:
-            for i, s in enumerate(self._sensors):
-                if s.device_path == self._webcam_dev:
-                    preselect = i
-                    break
-        self._sensor_dd.set_selected(preselect)
-        if self._sensors:
-            self._start_source(self._sensors[preselect].device_path)
-        else:
-            self.status.set_text("No sensors found — plug one in and hit rescan")
+        devices = self._devmgr.scan()
 
-    def _on_sensor_changed(self, dd, _pspec):
-        idx = dd.get_selected()
-        if idx < len(self._sensors):
-            self._stop_capture()
-            self._start_source(self._sensors[idx].device_path)
+        while True:
+            row = self._device_list.get_row_at_index(0)
+            if row is None:
+                break
+            self._device_list.remove(row)
+
+        if not devices:
+            row = Gtk.ListBoxRow()
+            row.set_child(Gtk.Label(label="No sensors found"))
+            row.set_activatable(False)
+            self._device_list.append(row)
+            self.status.set_text("No sensors found — plug in and hit Rescan")
+            return
+
+        preselect_idx = 0
+        for i, dev in enumerate(devices):
+            tag = f" ({dev.vid}:{dev.pid})" if dev.vid else ""
+            label = Gtk.Label(label=f"{dev.name}{tag}")
+            label.set_xalign(0)
+            label.set_margin_start(6)
+            label.set_margin_top(4)
+            label.set_margin_bottom(4)
+            row = Gtk.ListBoxRow()
+            row.set_child(label)
+            self._device_list.append(row)
+            if self._webcam_dev and dev.device_path == self._webcam_dev:
+                preselect_idx = i
+
+        self._device_list.select_row(
+            self._device_list.get_row_at_index(preselect_idx))
+
+        n_devs = len(devices)
+        self._fusion_devices_label.set_text(
+            f"{n_devs} device{'s' if n_devs != 1 else ''} available for fusion")
+
+    def _on_device_selected(self, listbox, row):
+        if row is None:
+            return
+        idx = row.get_index()
+        devices = self._devmgr.devices
+        if idx >= len(devices):
+            return
+        self._stop_capture()
+        dev = devices[idx]
+        self._start_source(dev)
+
+    def _on_fusion_toggled(self, btn):
+        visible = btn.get_active()
+        self._fusion_panel.set_visible(visible)
+        self._sep_r.set_visible(visible)
 
     def _stop_capture(self):
         if self.infer:
@@ -302,10 +495,10 @@ class Viewer(Gtk.Application):
             self.reader = None
         self._last_shown_n = -1
 
-    def _start_source(self, devpath):
-        self.status.set_text(f"Opening {devpath}…")
+    def _start_source(self, device):
+        self.status.set_text(f"Opening {device.name} ({device.device_path})…")
         try:
-            self.reader = V4L2Reader(devpath)
+            self.reader = _make_reader(device)
             self.reader.start()
             self.infer = WebcamInference(self.reader)
             self.infer.start()
@@ -335,7 +528,12 @@ class Viewer(Gtk.Application):
             now = GLib.get_monotonic_time()
             if now - self._fps_t > 1_000_000:
                 self._fps = self._fps_n * 1e6 / (now - self._fps_t)
-                self._fps_t = now; self._fps_n = 0
+                self._fps_t = now
+                self._fps_n = 0
+
+            if self._recording and self._rec_dir:
+                self._save_rec_frame(rgb, info)
+
             sem = info.get("sem")
             sem_str = ""
             if sem:
@@ -347,9 +545,10 @@ class Viewer(Gtk.Application):
                            f" grab={sem['grab_strength']:.0%} {fingers}")
             lr = info.get("hand_lr", "")
             kc = info.get("kp_conf", 0.0)
+            rec = " [REC]" if self._recording else ""
             self.status.set_text(
                 f"cam {self._dev_fps:.0f} fps | infer {self._fps:.0f} fps | "
-                f"hands={info.get('hands', 0)} {lr} conf={kc:.2f}{sem_str}")
+                f"hands={info.get('hands', 0)} {lr} conf={kc:.2f}{sem_str}{rec}")
         elif self.reader and not self.reader.is_alive():
             self.status.set_text("webcam disconnected")
         return True
@@ -370,7 +569,34 @@ class Viewer(Gtk.Application):
             json.dump(info, f, indent=1)
         self.status.set_text(f"snapshot → snapshots/{ts}/")
 
+    def _on_record_toggled(self, btn):
+        if btn.get_active():
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            self._rec_dir = os.path.join(HERE, "recordings", ts)
+            os.makedirs(self._rec_dir, exist_ok=True)
+            self._rec_seq = 0
+            self._recording = True
+        else:
+            self._recording = False
+            if self._rec_dir:
+                self.status.set_text(
+                    f"recording stopped → recordings/{os.path.basename(self._rec_dir)}/")
+            self._rec_dir = None
+
+    def _save_rec_frame(self, rgb, info):
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape
+        fname = os.path.join(self._rec_dir, f"{self._rec_seq:06d}.pgm")
+        with open(fname, "wb") as f:
+            f.write(f"P5\n{w} {h}\n255\n".encode())
+            f.write(gray.tobytes())
+        results_path = os.path.join(self._rec_dir, "results.jsonl")
+        with open(results_path, "a") as f:
+            f.write(json.dumps({"seq": self._rec_seq, **info}) + "\n")
+        self._rec_seq += 1
+
     def _on_close(self, *_):
+        self._recording = False
         if self.infer:
             self.infer.stop()
         if self.reader:
@@ -378,12 +604,17 @@ class Viewer(Gtk.Application):
         return False
 
 
-if __name__ == "__main__":
+def main():
     import argparse
     p = argparse.ArgumentParser(description="OpenMotion live hand-tracking viewer")
-    p.add_argument("--device", help="V4L2 device path to open first (auto-detected if omitted)")
+    p.add_argument("--device",
+                   help="Device path to open first (auto-detected if omitted)")
     args = p.parse_args()
     app = Viewer()
     if args.device:
         app._webcam_dev = args.device
     app.run(None)
+
+
+if __name__ == "__main__":
+    main()

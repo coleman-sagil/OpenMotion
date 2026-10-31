@@ -24,7 +24,8 @@ grew out of).
 | path | what |
 |---|---|
 | `rust-driver/` | Rust USB driver (libusb/`rusb`): device bring-up, stereo IR streaming, exposure/LED control, calibration reader. Also exports the `leap_open_*` C ABI as `libopenleap.a` for the Monado driver |
-| `tracking/` | Python SDK + hand-tracking pipeline: `pose_frame.py` (26-joint OpenXR types + `derive_semantics`), `webcam_solver.py` (ONNX palm+landmark), `detect.py` (sensor enumeration), `live_viewer.py` (GTK4 viewer), stereo calibration/triangulation |
+| `tracking/` | Python SDK + hand-tracking pipeline: `pose_frame.py` (26-joint OpenXR types + `derive_semantics`), `webcam_solver.py` (ONNX palm+landmark), `detect.py` / `device_registry.py` (sensor enumeration), `fusion.py` (multi-device fusion + Kabsch calibration), `live_viewer.py` (GTK4/Adw viewer), stereo calibration/triangulation |
+| `pyproject.toml` | SDK packaging — `uv pip install -e ".[full]"` installs the `openmotion` CLI |
 | `monado-driver/` | design/reference docs for the Monado `leap_open` driver — the engine path Leap → Mercury (the built C driver lives in the monado fork) |
 | `reverse-engineering/` | the protocol recon that made the driver possible (usbmon capture analysis, decoded init sequence) — historical record, nothing runs from here |
 | `hand-tracking-models/` | Monado's openly-licensed (CC-BY-SA 4.0) Mercury ONNX models + MediaPipe palm/landmark models — separate git clone, see Setup |
@@ -109,24 +110,37 @@ Per eye, per frame (`skeleton.py`, conventions ported from Monado Mercury's
 inverts Leap's radial distortion model into OpenCV coefficients via curve
 fit, and builds stereo-rectified undistortion maps (`calib.npz`).
 
-`live_viewer.py` is the OpenMotion Viewer: a GTK4 app that captures from any
-detected sensor (webcam or Leap V4L2 node), runs ONNX hand detection via
-`WebcamPoseSolver`, and shows a live skeleton overlay with per-frame semantic
-readout (pinch %, grab %, finger extension). Sensor dropdown for hot-plug,
-gain slider, snapshot export.
+`live_viewer.py` is the OpenMotion Viewer: a GTK4/Adw app with a device
+sidebar (powered by `device_registry.py`), live camera view with ONNX hand
+detection via `WebcamPoseSolver`, and a collapsible fusion config panel.
+Shows per-frame semantic readout (pinch %, grab %, finger extension), supports
+gain control, snapshot export, and frame recording (PGM + results.jsonl).
+Uses V4L2 raw ioctls on Linux and OpenCV capture everywhere else.
 
-## Setup
+## Quick Install
 
 ```bash
-# deps: rust, python3, gtk4 + pygobject (system), polkit, uv
 git clone https://github.com/coleman-sagil/OpenMotion.git
 cd OpenMotion
 git clone https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models.git
 uv venv --system-site-packages .venv
-uv pip install onnxruntime opencv-python-headless numpy scipy
+uv pip install -e ".[full]"    # numpy, scipy, onnxruntime, opencv, PyGObject
 ( cd rust-driver && cargo build )
+```
+
+Then run the viewer:
+```bash
+.venv/bin/openmotion               # GTK4 viewer (auto-detects sensors)
+.venv/bin/openmotion --detect      # list sensors and exit
+.venv/bin/python -m tracking       # same as above
+```
+
+Or the one-command live script:
+```bash
 ./run_live.sh        # one polkit prompt: stops any closed leapd, claims the device
 ```
+
+## Setup (manual)
 
 The closed `ultraleap-hand-tracking-service` must not hold the device;
 `run_live.sh` stops it for the session.

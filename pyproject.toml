@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openmotion"
+version = "0.1.0"
+description = "Open-source multi-sensor hand tracking SDK"
+license = {text = "BSL-1.0"}
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+tracking = ["onnxruntime", "opencv-python-headless"]
+ui = ["PyGObject"]
+full = ["onnxruntime", "opencv-python-headless", "PyGObject"]
+
+[project.scripts]
+openmotion = "tracking.live_viewer:main"
+openmotion-detect = "tracking.detect:main"

@@ -119,5 +119,11 @@ def print_sensors() -> None:
         print(f"  [{s.type}] {s.name} at {s.device_path}{suffix}")
 
 
-if __name__ == "__main__":
+def main():
+    print("OpenMotion Sensor Detection")
+    print("=" * 40)
     print_sensors()
+
+
+if __name__ == "__main__":
+    main()
